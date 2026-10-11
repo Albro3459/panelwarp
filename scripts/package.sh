@@ -57,7 +57,9 @@ rm -f "$STAGE/package-lock.json"
 cp -R "$SRC" "$STAGE/bundle"
 find "$STAGE/bundle/assets/png/onboarding" -type f ! -name '*_banner-*' -delete
 
-# Brotli-compress the large text-like files.
+# Brotli-compress the large text-like files (NO_BROTLI=1 skips it for quick local test installs;
+# the server then serves the files as they are).
+if [ -n "${NO_BROTLI:-}" ]; then echo '{}' >"$STAGE/precompressed.json"; else
 (
   cd "$STAGE"
   echo '{' >precompressed.json
@@ -71,6 +73,7 @@ find "$STAGE/bundle/assets/png/onboarding" -type f ! -name '*_banner-*' -delete
   done
   printf '\n}\n' >>precompressed.json
 )
+fi
 
 (cd "$STAGE" && npx --yes @vscode/vsce package --target "$TARGET" \
   --allow-missing-repository -o "$OUT")
