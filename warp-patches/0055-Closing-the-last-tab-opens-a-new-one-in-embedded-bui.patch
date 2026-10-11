@@ -1,0 +1,60 @@
+From 0aa8459e8bf380b93685f70fad0afc3c08241d4f Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Sun, 11 Oct 2026 14:37:44 -0700
+Subject: [PATCH 55/55] Closing the last tab opens a new one in embedded builds
+
+Closing the last tab closed the window, which left the embedded page
+dead (no window state, no input). Like a last tab whose shell exits, a
+new tab now takes its place; the close-window action is a no-op there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/workspace/view.rs | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 151d80e..a96eb2c 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -12335,6 +12335,20 @@ impl Workspace {
+         self.vertical_tabs_panel
+             .clear_detail_sidecar_if_for_pane_group(pane_group.id());
+ 
++        // The embedded app has no window to close (closing it leaves a dead page), so the last
++        // tab is replaced by a new one, as when its shell exits.
++        if cfg!(feature = "remote_tty") && self.tabs.len() == 1 {
++            self.add_new_session_tab_internal_with_default_session_mode_behavior(
++                NewSessionSource::Tab,
++                Some(ctx.window_id()),
++                None,
++                None,
++                false, /* hide_homepage */
++                DefaultSessionModeBehavior::Ignore,
++                ctx,
++            );
++        }
++
+         // If this is the last tab, close the window instead of actually removing
+         // the tab.
+         if self.tabs.len() == 1 {
+@@ -12540,7 +12554,9 @@ impl Workspace {
+         add_to_undo_stack: bool,
+         ctx: &mut ViewContext<Self>,
+     ) {
+-        let is_last_tab = self.tabs.len() == 1;
++        // Embedded builds replace the last tab instead of closing the window (see remove_tab),
++        // so it is closed like any other tab, with its own confirmation.
++        let is_last_tab = self.tabs.len() == 1 && !cfg!(feature = "remote_tty");
+         if !ContextFlag::CloseWindow.is_enabled() && is_last_tab {
+             return;
+         }
+@@ -25600,7 +25616,8 @@ impl TypedActionView for Workspace {
+                 ctx.terminate_app(TerminationMode::Cancellable, None);
+             }
+             CloseWindow => {
+-                if ContextFlag::CloseWindow.is_enabled() {
++                // Embedded builds have one window, owned by the host; closing it leaves a dead page.
++                if ContextFlag::CloseWindow.is_enabled() && !cfg!(feature = "remote_tty") {
+                     ctx.close_window();
+                 }
+             }
