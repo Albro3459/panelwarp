@@ -54,6 +54,12 @@
           "type": "webview",
           "id": "warp.view",
           "name": "Warp"
+        },
+        {
+          "type": "webview",
+          "id": "warp.panelLauncher",
+          "name": "Warp",
+          "when": "warp.inSideBar"
         }
       ],
       "warp-launcher": [

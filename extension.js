@@ -94,6 +94,7 @@ const IN_SIDE_BAR_KEY = 'warp.inSideBar';
 
 /** Moves the Warp view between the bottom panel and the activity bar's side bar container. */
 async function moveWarpView(context, toSideBar) {
+  lastMove = Date.now();
   await context.globalState.update(IN_SIDE_BAR_KEY, toSideBar);
   await vscode.commands.executeCommand('setContext', IN_SIDE_BAR_KEY, toSideBar);
   await vscode.commands.executeCommand('vscode.moveViews', {
@@ -101,6 +102,30 @@ async function moveWarpView(context, toSideBar) {
     destinationId: `workbench.view.extension.${toSideBar ? 'warp-launcher' : 'warp'}`,
   });
   await vscode.commands.executeCommand('warp.view.focus');
+}
+let lastMove = 0;
+
+/**
+ * A placeholder that keeps a Warp button where Warp currently isn't (activity bar or bottom
+ * panel); showing it moves Warp there. Right after a move the other place's placeholder can show
+ * up on its own (its container was open), which closes that side bar or panel instead.
+ */
+function warpLauncher(context, toSideBar) {
+  return {
+    resolveWebviewView(view) {
+      view.webview.html = '<body></body>';
+      const moveHere = () => {
+        if (!view.visible) return;
+        if (Date.now() - lastMove < 1500) {
+          vscode.commands.executeCommand(toSideBar ? 'workbench.action.closeSidebar' : 'workbench.action.closePanel');
+        } else {
+          moveWarpView(context, toSideBar);
+        }
+      };
+      view.onDidChangeVisibility(moveHere);
+      moveHere();
+    },
+  };
 }
 
 class WarpViewProvider {
@@ -548,19 +573,10 @@ function activate(context) {
     vscode.window.registerWebviewViewProvider('warp.view', provider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
-    // The activity bar's Warp button moves the Warp view itself (same tabs and shells) into
-    // its side bar container; the placeholder view only exists so the button shows while Warp
-    // is in the bottom panel, and hides once Warp is there.
-    vscode.window.registerWebviewViewProvider('warp.launcher', {
-      resolveWebviewView(view) {
-        view.webview.html = '<body></body>';
-        const moveHere = () => {
-          if (view.visible) moveWarpView(context, true);
-        };
-        view.onDidChangeVisibility(moveHere);
-        moveHere();
-      },
-    }),
+    // The activity bar's and the bottom panel's Warp buttons both stay; each moves the Warp view
+    // itself (same tabs and shells, like Claude Code's side bar) to its place.
+    vscode.window.registerWebviewViewProvider('warp.launcher', warpLauncher(context, true)),
+    vscode.window.registerWebviewViewProvider('warp.panelLauncher', warpLauncher(context, false)),
     vscode.commands.registerCommand('warp.moveToSideBar', () => moveWarpView(context, true)),
     vscode.commands.registerCommand('warp.moveToPanel', () => moveWarpView(context, false)),
     vscode.commands.registerCommand('warp.show', () => vscode.commands.executeCommand('warp.view.focus')),
