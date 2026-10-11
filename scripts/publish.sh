@@ -33,5 +33,13 @@ for target in "${TARGETS[@]}"; do
   [ -f "panelwarp-$target.vsix" ] || { tail -20 "/tmp/panelwarp-package-$target.log"; exit 1; }
 done
 
-npx --yes @vscode/vsce publish --packagePath panelwarp-*.vsix
+# One upload per package, with retries: publishing all four in one call failed with EPIPE
+# (2026-10-11), while single uploads went through.
+for vsix in panelwarp-*.vsix; do
+  for try in 1 2 3; do
+    npx --yes @vscode/vsce publish --packagePath "$vsix" && break
+    [ $try = 3 ] && { echo "upload of $vsix failed"; exit 1; }
+    sleep 10
+  done
+done
 echo "published $VERSION: https://marketplace.visualstudio.com/items?itemName=felixkrueckel.panelwarp"
