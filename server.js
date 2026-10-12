@@ -32,7 +32,10 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const { execFile } = require('child_process');
 const { WebSocketServer } = require('ws');
-const pty = require('node-pty');
+// node-pty is native code: loaded only in the PTY host (on the first spawn), never in VS Code's
+// extension host, which shares its process with other extensions (e.g. Claude Code) and loads
+// this file for shellLaunch/wasmEtag. Replacing the extension under a loaded addon crashed it.
+let pty;
 const { ShellRecorder } = require('./shellRecorder');
 
 const HOST = '127.0.0.1';
@@ -278,6 +281,7 @@ async function startServer({
       existingDirectory(url.searchParams.get('cwd')) || existingDirectory(url.searchParams.get('default_cwd')) || cwd;
     const cols = Number(url.searchParams.get('num_cols')) || 80;
 
+    pty ??= require('node-pty');
     const term = pty.spawn(launch.file, launch.args, {
       name: 'xterm-256color',
       cols,
