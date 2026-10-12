@@ -21,6 +21,7 @@ const DEFAULTS = {
   HostAiLocalModel: '',
   HostAiLocalServer: 'http://127.0.0.1:1234/v1',
   HostKeysToHost: {},
+  HostMemoryWarningGb: 3.5,
 };
 
 /** Keys that go to VS Code instead of Warp; `host.keys_to_host` adds to or ("") removes these. */
@@ -80,6 +81,12 @@ class PanelSettings {
       // Prompt Suggestions send command output too.
       promptSuggestions: privateRouting && this.get('HostAiPromptSuggestions') === true,
     };
+  }
+
+  /** GB of memory per VS Code process above which the memory monitor warns; 0 = never. */
+  memoryWarningGb() {
+    const gb = Number(this.get('HostMemoryWarningGb'));
+    return Number.isFinite(gb) && gb >= 0 ? gb : DEFAULTS.HostMemoryWarningGb;
   }
 
   /** Key spec (e.g. "cmd+shift+p") -> VS Code command. */

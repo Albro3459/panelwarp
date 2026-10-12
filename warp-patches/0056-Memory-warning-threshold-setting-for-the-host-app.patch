@@ -1,0 +1,34 @@
+From 17bd396dd77c1e55a033a610b4f2aac2d6e212fd Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Sun, 11 Oct 2026 17:55:24 -0700
+Subject: [PATCH 56/56] Memory warning threshold setting for the host app
+
+host.memory_warning_gb (default 3.5, 0 = off): the VS Code extension warns when one of
+the window's processes passes it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/settings/host_ai.rs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/app/src/settings/host_ai.rs b/app/src/settings/host_ai.rs
+index 4130e2d..c55e3ef 100644
+--- a/app/src/settings/host_ai.rs
++++ b/app/src/settings/host_ai.rs
+@@ -172,6 +172,16 @@ define_settings_group!(HostAiSettings, settings: [
+         toml_path: "host.history_sync",
+         description: "Sync your newest commands (up to 500) across machines with VS Code Settings Sync. Commands starting with a space aren't synced.",
+     },
++    memory_warning_gb: HostMemoryWarningGb {
++        type: f32,
++        default: 3.5,
++        supported_platforms: SupportedPlatforms::ALL,
++        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
++        surface: settings::SettingSurfaces::GUI,
++        private: false,
++        toml_path: "host.memory_warning_gb",
++        description: "Warn when a VS Code process (the extension host, a window or a webview) uses more than this many GB of memory; VS Code crashes a process when its JavaScript heap reaches about 4 GB. 0 turns the warning off.",
++    },
+     keys_to_host: HostKeysToHost {
+         type: HashMap<String, String>,
+         default: HashMap::default(),

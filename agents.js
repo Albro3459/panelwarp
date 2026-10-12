@@ -508,9 +508,83 @@ class AgentConversations {
     });
     return undefined;
   }
+
+  /**
+   * Moves about half of this window's Claude Code tabs, by conversation size, into a new window
+   * of the same folder. Each window has its own extension host and renderer, so this splits the
+   * memory of big conversations (VS Code crashes a process near 4 GB). The half with the tab in
+   * front stays here.
+   */
+  async splitClaudeTabs(storageDir) {
+    const tabs = vscode.window.tabGroups.all
+      .flatMap((group) => group.tabs)
+      .filter((tab) => tab.input instanceof vscode.TabInputWebview && /claudeVSCodePanel$/.test(tab.input.viewType));
+    const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+    if (!folders.length) throw new Error('Open a folder first: Claude Code resumes conversations per folder.');
+
+    // Tabs only tell us their title; match each to the newest unclaimed conversation of this folder.
+    const conversations = JSON.parse(this.list()).filter((c) => c.agent === 'claude' && folders.includes(c.cwd));
+    const matched = [];
+    const claimed = new Set();
+    for (const tab of tabs) {
+      const label = normalizeTitle(tab.label);
+      const conversation =
+        label &&
+        conversations.find(
+          (c) => !claimed.has(c.id) && (normalizeTitle(c.title).startsWith(label) || label.startsWith(normalizeTitle(c.title) || '\0')),
+        );
+      if (!conversation) continue;
+      claimed.add(conversation.id);
+      let size = 0;
+      try {
+        size = this.entry('claude', conversation.id).size;
+      } catch {}
+      matched.push({ tab, id: conversation.id, cwd: conversation.cwd, size });
+    }
+    if (matched.length < 2) {
+      throw new Error(
+        `Found ${tabs.length} Claude Code tab${tabs.length === 1 ? '' : 's'} here` +
+          (tabs.length > matched.length ? ` (${matched.length} matched to a conversation)` : '') +
+          '; splitting needs at least 2.',
+      );
+    }
+
+    // Biggest first into the lighter half; the half holding the active tab stays.
+    const halves = [
+      { tabs: [], size: 0 },
+      { tabs: [], size: 0 },
+    ];
+    for (const m of matched.sort((a, b) => b.size - a.size)) {
+      const half = halves[0].size <= halves[1].size ? halves[0] : halves[1];
+      half.tabs.push(m);
+      half.size += m.size;
+    }
+    const moving = halves.find((half) => !half.tabs.some((m) => m.tab.isActive && m.tab.group.isActive)) || halves[1];
+
+    // The same folder can't be open in two windows, but a workspace file listing it can.
+    const dir = path.join(storageDir, 'split-windows');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try {
+        if (Date.now() - fs.statSync(file).mtimeMs > 30 * 24 * 3600 * 1000) fs.rmSync(file);
+      } catch {}
+    }
+    const name = `${path.basename(folders[0])} ${new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '.')}`;
+    const workspaceFile = path.join(dir, `${name.replace(/[^\w .-]/g, '_')}.code-workspace`);
+    fs.writeFileSync(workspaceFile, JSON.stringify({ folders: folders.map((folder) => ({ path: folder })) }, null, 2));
+
+    const ids = moving.tabs.map((m) => m.id);
+    await this.globalState.update(PENDING_OPEN_KEY, { folder: folders[0], ids, at: Date.now() });
+    // Closed here first, so one conversation is never open in two windows at once.
+    await vscode.window.tabGroups.close(moving.tabs.map((m) => m.tab));
+    await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(workspaceFile), { forceNewWindow: true });
+    this.log.appendLine(`agents: moved ${ids.length} of ${matched.length} Claude tabs to a new window`);
+    return { moved: ids.length, total: matched.length };
+  }
 }
 
-/** On activation: opens a Claude conversation another window handed to this window's folder. */
+/** On activation: opens Claude conversations another window handed to this window's folder. */
 async function openPendingClaudeConversation(globalState, log) {
   const pending = globalState.get(PENDING_OPEN_KEY);
   if (!pending) return;
@@ -523,7 +597,9 @@ async function openPendingClaudeConversation(globalState, log) {
   await globalState.update(PENDING_OPEN_KEY, undefined);
   try {
     await vscode.extensions.getExtension('anthropic.claude-code')?.activate();
-    await vscode.commands.executeCommand('claude-vscode.editor.open', pending.id);
+    for (const id of pending.ids || [pending.id]) {
+      await vscode.commands.executeCommand('claude-vscode.editor.open', id);
+    }
   } catch (error) {
     log.appendLine(`agents: could not open Claude conversation: ${error.message}`);
   }

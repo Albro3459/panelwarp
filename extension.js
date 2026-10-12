@@ -19,6 +19,7 @@ const { SessionStore } = require('./sessionStore');
 const filePaths = require('./filePaths');
 const { readWorkflowFiles } = require('./workflows');
 const { AgentConversations, openPendingClaudeConversation } = require('./agents');
+const { MemoryMonitor } = require('./memoryMonitor');
 
 // Warp's default macOS shortcuts, sent as synthetic keystrokes by the "Warp: ..." commands.
 const WARP_KEYS = {
@@ -567,6 +568,10 @@ function activate(context) {
   // VS Code remembers where views were moved (per profile); the context key hides the
   // placeholder while Warp is in the side bar.
   vscode.commands.executeCommand('setContext', IN_SIDE_BAR_KEY, context.globalState.get(IN_SIDE_BAR_KEY, false));
+  // `ps` isn't on Windows.
+  if (process.platform !== 'win32') {
+    context.subscriptions.push(new MemoryMonitor(() => provider.panelSettings.memoryWarningGb(), log));
+  }
   context.subscriptions.push(
     log,
     provider,
@@ -579,6 +584,14 @@ function activate(context) {
     vscode.window.registerWebviewViewProvider('warp.panelLauncher', warpLauncher(context, false)),
     vscode.commands.registerCommand('warp.moveToSideBar', () => moveWarpView(context, true)),
     vscode.commands.registerCommand('warp.moveToPanel', () => moveWarpView(context, false)),
+    vscode.commands.registerCommand('warp.splitClaudeTabs', async () => {
+      try {
+        const { moved, total } = await provider.agents.splitClaudeTabs(context.globalStorageUri.fsPath);
+        log.appendLine(`moved ${moved} of ${total} Claude Code tabs to a new window`);
+      } catch (error) {
+        vscode.window.showWarningMessage(error.message);
+      }
+    }),
     vscode.commands.registerCommand('warp.show', () => vscode.commands.executeCommand('warp.view.focus')),
     vscode.commands.registerCommand('warp.restart', () => provider.restart()),
     vscode.commands.registerCommand('warp.benchmarkCommandSearch', () => provider.ai.benchmark()),
