@@ -1,7 +1,7 @@
 From 0aa8459e8bf380b93685f70fad0afc3c08241d4f Mon Sep 17 00:00:00 2001
 From: Felix Krueckel <hi@felkru.com>
 Date: Sun, 11 Oct 2026 14:37:44 -0700
-Subject: [PATCH 55/58] Closing the last tab opens a new one in embedded builds
+Subject: [PATCH 55/59] Closing the last tab opens a new one in embedded builds
 
 Closing the last tab closed the window, which left the embedded page
 dead (no window state, no input). Like a last tab whose shell exits, a

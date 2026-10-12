@@ -1,0 +1,298 @@
+From 37a5d1e87bd89074cfd1686d3e05668e10db4e53 Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Mon, 12 Oct 2026 16:18:52 -0700
+Subject: [PATCH 59/59] Agents panel: summaries behind an info button instead
+ of on hover
+
+The AI summary popover opened whenever the pointer rested on a row and
+covered the view. A row now shows an info button while hovered; clicking it
+shows or hides that row's summary, which also closes when the pointer
+leaves the list or the context menu opens.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/workspace/view/agent_conversations.rs | 130 +++++++++++-------
+ 1 file changed, 82 insertions(+), 48 deletions(-)
+
+diff --git a/app/src/workspace/view/agent_conversations.rs b/app/src/workspace/view/agent_conversations.rs
+index 46d2a72..df233ed 100644
+--- a/app/src/workspace/view/agent_conversations.rs
++++ b/app/src/workspace/view/agent_conversations.rs
+@@ -1,6 +1,6 @@
+ //! The Agents panel for embedded (`remote_tty`) builds: recent coding-agent conversations
+ //! (Claude Code, Codex, Gemini CLI) from anywhere on the machine, as listed by the embedding host
+-//! (the VS Code panel). Hovering a row streams a short AI summary of it from the host; clicking
++//! (the VS Code panel). A row's info button streams a short AI summary of it from the host; clicking
+ //! opens it in the host (Claude Code) or resumes it in a new tab (agents that run in a terminal).
+ //! A conversation gets a blue unread dot when its latest turn finished while you weren't looking:
+ //! for one running in one of Warp's own tabs, the same dot as that tab in the vertical tabs
+@@ -19,7 +19,9 @@ use chrono::{DateTime, Utc};
+ use pathfinder_geometry::vector::{Vector2F, vec2f};
+ use warp_core::ui::theme::Fill as ThemeFill;
+ use warp_util::path::user_friendly_path;
+-use warpui::r#async::{SpawnedFutureHandle, Timer};
++use warpui::r#async::SpawnedFutureHandle;
++#[cfg(target_family = "wasm")]
++use warpui::r#async::Timer;
+ use warpui::elements::{
+     Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+     DispatchEventResult, DropShadow, Element, EventHandler, Fill, Flex, Hoverable,
+@@ -46,9 +48,6 @@ use crate::util::time_format::format_approx_duration_from_now_utc;
+ use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
+ use crate::workspace::tab_settings::TabSettings;
+ 
+-/// How long the pointer has to rest on a row before its summary is requested, so sweeping over
+-/// the list doesn't start a request per row.
+-const SUMMARY_HOVER_DELAY: Duration = Duration::from_millis(450);
+ /// How often the list is reloaded from the host once it's been shown.
+ #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+ const REFRESH_INTERVAL: Duration = Duration::from_secs(4);
+@@ -56,6 +55,7 @@ const ICON_SIZE: f32 = 20.;
+ const ICON_SPACING: f32 = 8.;
+ const SUMMARY_MAX_WIDTH: f32 = 360.;
+ const UNREAD_DOT_SIZE: f32 = 8.;
++const SUMMARY_BUTTON_SIZE: f32 = 14.;
+ 
+ #[derive(Clone, Debug, serde::Deserialize)]
+ #[serde(rename_all = "camelCase")]
+@@ -121,6 +121,8 @@ impl OpenTarget {
+ pub enum AgentConversationsAction {
+     SetHoveredIndex(usize),
+     ClearHoveredIndex,
++    /// Shows or hides the summary of the row at this index.
++    ToggleSummary(usize),
+     Open(usize),
+     OpenWith(usize, OpenTarget),
+     OpenContextMenu { index: usize, position: Vector2F },
+@@ -144,12 +146,15 @@ pub struct AgentConversationsView {
+     host_conversations: Vec<HostAgentConversation>,
+     loaded: bool,
+     row_states: Vec<MouseStateHandle>,
++    summary_button_states: Vec<MouseStateHandle>,
+     list_hover: MouseStateHandle,
+     list_state: UniformListState,
+     scroll_state: ScrollStateHandle,
+     hovered_index: Option<usize>,
+     summaries: HashMap<String, Summary>,
+-    hover_delay: Option<SpawnedFutureHandle>,
++    /// The row whose summary is shown; only its info button opens it, so it doesn't cover the
++    /// view while you move over the list.
++    summary_index: Option<usize>,
+     /// The host's last answer, to skip redrawing when nothing changed.
+     last_json: Option<String>,
+     refresh_timer: Option<SpawnedFutureHandle>,
+@@ -198,12 +203,13 @@ impl AgentConversationsView {
+             host_conversations: Vec::new(),
+             loaded: false,
+             row_states: Vec::new(),
++            summary_button_states: Vec::new(),
+             list_hover: Default::default(),
+             list_state: UniformListState::new(),
+             scroll_state: Arc::new(Mutex::new(Default::default())),
+             hovered_index: None,
+             summaries: HashMap::new(),
+-            hover_delay: None,
++            summary_index: None,
+             last_json: None,
+             refresh_timer: None,
+         }
+@@ -298,54 +304,41 @@ impl AgentConversationsView {
+             .collect();
+         rows.extend(self.host_conversations.iter().cloned());
+ 
+-        // Keep the hover (and its summary) when the hovered row is still the same conversation.
+-        let hovered = self
+-            .hovered_index
+-            .and_then(|index| self.conversations.get(index))
+-            .map(|conversation| (conversation.agent.clone(), conversation.id.clone()));
+-        let hovered_index = hovered.and_then(|(agent, id)| {
+-            rows.iter()
+-                .position(|conversation| conversation.agent == agent && conversation.id == id)
+-        });
++        // Keep the hover and the open summary on their conversations when rows move.
++        let new_index = |index: Option<usize>| {
++            let conversation = self.conversations.get(index?)?;
++            rows.iter().position(|row| row.agent == conversation.agent && row.id == conversation.id)
++        };
++        let hovered_index = new_index(self.hovered_index);
++        let summary_index = new_index(self.summary_index);
+         self.row_states
+             .resize_with(rows.len(), MouseStateHandle::default);
++        self.summary_button_states
++            .resize_with(rows.len(), MouseStateHandle::default);
+         self.conversations = rows;
+-        if hovered_index != self.hovered_index {
+-            self.hovered_index = None;
+-            self.cancel_hover_delay();
+-        }
++        self.hovered_index = hovered_index;
++        self.summary_index = summary_index;
+         ctx.notify();
+     }
+ 
+-    fn cancel_hover_delay(&mut self) {
+-        if let Some(handle) = self.hover_delay.take() {
+-            handle.abort();
+-        }
+-    }
+-
+     fn set_hovered_index(&mut self, index: Option<usize>, ctx: &mut ViewContext<Self>) {
+         if self.hovered_index == index {
+             return;
+         }
+         self.hovered_index = index;
+-        self.cancel_hover_delay();
+-        if let Some(index) = index {
+-            // The host can only summarize conversations it listed.
+-            let already_requested = self.conversations.get(index).is_some_and(|conversation| {
+-                conversation.pane_only.is_some()
+-                    || self.summaries.contains_key(&conversation.summary_key())
+-            });
+-            if !already_requested {
+-                self.hover_delay = Some(ctx.spawn(
+-                    Timer::after(SUMMARY_HOVER_DELAY),
+-                    move |me, _, ctx| {
+-                        me.hover_delay = None;
+-                        if me.hovered_index == Some(index) {
+-                            me.request_summary(index, ctx);
+-                        }
+-                    },
+-                ));
+-            }
++        // Leaving the list closes the summary.
++        if index.is_none() {
++            self.summary_index = None;
++        }
++        ctx.notify();
++    }
++
++    fn toggle_summary(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
++        if self.summary_index == Some(index) {
++            self.summary_index = None;
++        } else {
++            self.summary_index = Some(index);
++            self.request_summary(index, ctx);
+         }
+         ctx.notify();
+     }
+@@ -356,6 +349,10 @@ impl AgentConversationsView {
+         let Some(conversation) = self.conversations.get(index) else {
+             return;
+         };
++        // The host can only summarize conversations it listed.
++        if conversation.pane_only.is_some() {
++            return;
++        }
+         let key = conversation.summary_key();
+         if self.summaries.contains_key(&key) {
+             return;
+@@ -454,6 +451,7 @@ impl AgentConversationsView {
+             );
+         }
+         self.set_hovered_index(None, ctx);
++        self.summary_index = None;
+         self.context_menu_position = Some(position);
+         self.context_menu.update(ctx, move |menu, ctx| {
+             menu.set_items(items, ctx);
+@@ -516,6 +514,7 @@ impl TypedActionView for AgentConversationsView {
+                 self.set_hovered_index(Some(*index), ctx)
+             }
+             AgentConversationsAction::ClearHoveredIndex => self.set_hovered_index(None, ctx),
++            AgentConversationsAction::ToggleSummary(index) => self.toggle_summary(*index, ctx),
+             AgentConversationsAction::Open(index) => self.open(*index, OpenTarget::Default, ctx),
+             AgentConversationsAction::OpenWith(index, target) => self.open(*index, *target, ctx),
+             AgentConversationsAction::OpenContextMenu { index, position } => {
+@@ -700,6 +699,8 @@ fn render_row(
+     index: usize,
+     is_hovered: bool,
+     summary: Option<&Summary>,
++    summary_open: bool,
++    summary_button_state: MouseStateHandle,
+     popover_opens_right: bool,
+     unread: bool,
+     status: Option<ConversationStatus>,
+@@ -754,6 +755,32 @@ fn render_row(
+                 .finish(),
+         );
+     }
++    // The summary sits behind this button so it doesn't cover the view on every hover. The host
++    // can only summarize conversations it listed.
++    if (is_hovered || summary_open) && conversation.pane_only.is_none() {
++        let color = if summary_open {
++            theme.accent().into()
++        } else {
++            theme.sub_text_color(theme.background())
++        };
++        let button = Hoverable::new(summary_button_state, move |state| {
++            let color = if state.is_hovered() {
++                theme.main_text_color(theme.background())
++            } else {
++                color
++            };
++            ConstrainedBox::new(Icon::Info.to_warpui_icon(color).finish())
++                .with_width(SUMMARY_BUTTON_SIZE)
++                .with_height(SUMMARY_BUTTON_SIZE)
++                .finish()
++        })
++        .with_cursor(Cursor::PointingHand)
++        .on_click(move |ctx, _, _| {
++            ctx.dispatch_typed_action(AgentConversationsAction::ToggleSummary(index));
++        })
++        .finish();
++        title_row.add_child(button);
++    }
+     let title_row = title_row.finish();
+ 
+     let home_dir = dirs::home_dir().and_then(|path| path.to_str().map(String::from));
+@@ -799,7 +826,7 @@ fn render_row(
+         .finish();
+ 
+     let popover = summary
+-        .filter(|_| is_hovered)
++        .filter(|_| summary_open)
+         .map(|summary| render_summary_popover(summary, appearance));
+     let row = Hoverable::new(mouse_state, move |_| {
+         let mut container = Container::new(content)
+@@ -828,6 +855,8 @@ fn render_row(
+         stack.finish()
+     })
+     .with_cursor(Cursor::PointingHand)
++    // A click on the summary button doesn't also open the conversation.
++    .with_defer_events_to_children()
+     .on_click(move |ctx, _, _| {
+         ctx.dispatch_typed_action(AgentConversationsAction::Open(index));
+     })
+@@ -908,13 +937,15 @@ impl View for AgentConversationsView {
+                 .collect()
+         };
+         let conversations = self.conversations.clone();
+-        let hovered_summary = self
+-            .hovered_index
++        let open_summary = self
++            .summary_index
+             .and_then(|index| self.conversations.get(index))
+             .and_then(|conversation| self.summaries.get(&conversation.summary_key()))
+             .cloned();
+         let hovered_index = self.hovered_index;
++        let summary_index = self.summary_index;
+         let row_states = self.row_states.clone();
++        let summary_button_states = self.summary_button_states.clone();
+         let position_id = self.position_id.clone();
+         let list = UniformList::new(
+             self.list_state.clone(),
+@@ -924,11 +955,14 @@ impl View for AgentConversationsView {
+                     .filter_map(|index| {
+                         let conversation = conversations.get(index)?;
+                         let is_hovered = hovered_index == Some(index);
++                        let summary_open = summary_index == Some(index);
+                         Some(render_row(
+                             conversation,
+                             index,
+                             is_hovered,
+-                            hovered_summary.as_ref().filter(|_| is_hovered),
++                            open_summary.as_ref().filter(|_| summary_open),
++                            summary_open,
++                            summary_button_states[index].clone(),
+                             popover_opens_right,
+                             states[index].0,
+                             states[index].1.clone(),

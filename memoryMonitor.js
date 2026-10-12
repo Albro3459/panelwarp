@@ -151,7 +151,9 @@ class MemoryMonitor {
     }[p.label];
     const split = 'Split Claude Tabs';
     const explorer = 'Process Explorer';
-    const choice = await vscode.window.showWarningMessage(`${what}. ${fix} (VS Code crashes near 4 GB).`, split, explorer);
+    // Only the extension host's limit is known (its JS heap); the others are measured by RSS.
+    const limit = p.heapLimit ? ` (its limit is ${gb(p.heapLimit)})` : '';
+    const choice = await vscode.window.showWarningMessage(`${what}. ${fix}${limit}.`, split, explorer);
     if (choice === split) vscode.commands.executeCommand('warp.splitClaudeTabs');
     if (choice === explorer) vscode.commands.executeCommand('workbench.action.openProcessExplorer');
   }
