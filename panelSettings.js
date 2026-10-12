@@ -33,6 +33,8 @@ const DEFAULT_KEYS_TO_VSCODE = {
   'cmd+shift+f': 'workbench.view.search',
   'cmd+shift+g': 'workbench.view.scm',
   'ctrl+`': 'workbench.action.terminal.toggleTerminal',
+  // Warp would otherwise take Cmd+Q as its own (no-op) quit.
+  'cmd+q': 'workbench.action.quit',
 };
 
 // localStorage holds each setting as a JSON string of its JSON-serialized value.
