@@ -1,7 +1,7 @@
 From 9e08cd0db33245653af1f9e3caaff21dc4f3597d Mon Sep 17 00:00:00 2001
 From: Felix Krueckel <hi@felkru.com>
 Date: Sun, 11 Oct 2026 18:04:27 -0700
-Subject: [PATCH 57/57] Agents panel right-click menu and moving a Claude
+Subject: [PATCH 57/58] Agents panel right-click menu and moving a Claude
  conversation to the host
 
 Right-clicking an Agents row offers: go to its Warp tab, open in the Claude Code

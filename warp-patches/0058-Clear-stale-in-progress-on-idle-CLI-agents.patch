@@ -1,0 +1,248 @@
+From 6d3133df46b7f79e29dad8abaeb7b2fc07ff83ea Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Sun, 11 Oct 2026 21:41:22 -0700
+Subject: [PATCH 58/58] Clear stale "in progress" on idle CLI agents
+
+A CLI agent session is registered as InProgress when its command is
+detected and only left that state on Stop/StopFailure or Ctrl-C. A freshly
+started or resumed Claude waiting for its first prompt, and a turn the user
+interrupted with Esc (Claude Code fires no hook for that), kept showing
+"in progress" in the vertical tabs and the Agents panel. SessionStart now
+marks the session idle, and IdlePrompt ends a turn still marked InProgress
+as Cancelled. Both change the status quietly so they don't notify like a
+finished task.
+
+Also restores the compute_valid_paths test helper the link-detection tests
+use, which the host path resolution change removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/terminal/cli_agent_sessions/mod.rs    | 40 +++++++++---
+ .../terminal/cli_agent_sessions/mod_tests.rs  | 60 +++++++++++++++++
+ app/src/terminal/view/link_detection.rs       | 64 +++++++++++++++----
+ 3 files changed, 141 insertions(+), 23 deletions(-)
+
+diff --git a/app/src/terminal/cli_agent_sessions/mod.rs b/app/src/terminal/cli_agent_sessions/mod.rs
+index 7b44cf7..f4c69c8 100644
+--- a/app/src/terminal/cli_agent_sessions/mod.rs
++++ b/app/src/terminal/cli_agent_sessions/mod.rs
+@@ -258,10 +258,26 @@ impl CLIAgentSession {
+                 CLIAgentSessionStatus::InProgress
+             }
+             // IdlePrompt means the agent is sitting at its prompt waiting for input.
+-            // This should not affect status — otherwise it would override Success after a Stop event.
+-            CLIAgentEventType::IdlePrompt => return None,
++            // It must not override Success after a Stop event, but a turn still marked
++            // InProgress has ended without a Stop: Claude Code fires no hook when the
++            // user interrupts it with Esc, so without this the tab stays "in progress".
++            // Changed quietly (no `StatusChanged`): the user ended the turn, so it
++            // shouldn't notify like a finished task.
++            CLIAgentEventType::IdlePrompt => {
++                if matches!(self.status, CLIAgentSessionStatus::InProgress) {
++                    self.status = CLIAgentSessionStatus::Cancelled;
++                }
++                return None;
++            }
++            // The agent just started (or resumed) and waits for its first prompt. The session
++            // was registered optimistically as InProgress when the command was detected, so
++            // without this a freshly started or resumed agent shows "in progress" while idle.
++            // Quietly too: nothing finished.
+             CLIAgentEventType::SessionStart => {
+                 self.plugin_version = event.payload.plugin_version.clone();
++                if matches!(self.status, CLIAgentSessionStatus::InProgress) {
++                    self.status = CLIAgentSessionStatus::Success;
++                }
+                 return None;
+             }
+             CLIAgentEventType::Unknown(_) => return None,
+@@ -517,7 +533,11 @@ impl CLIAgentSessionsModel {
+         }
+ 
+         let event_type = &event.event;
+-        if let Some(new_status) = session.apply_event(event) {
++        let status_before = session.status.clone();
++        let new_status = session.apply_event(event);
++        // A status set without `StatusChanged` (see `apply_event`) still has to re-render.
++        let changed_quietly = new_status.is_none() && session.status != status_before;
++        if let Some(new_status) = new_status {
+             let agent = session.agent;
+             ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+                 terminal_view_id,
+@@ -528,12 +548,14 @@ impl CLIAgentSessionsModel {
+             });
+         }
+ 
+-        if matches!(
+-            event_type,
+-            CLIAgentEventType::SessionStart
+-                | CLIAgentEventType::PromptSubmit
+-                | CLIAgentEventType::ToolComplete
+-        ) {
++        if changed_quietly
++            || matches!(
++                event_type,
++                CLIAgentEventType::SessionStart
++                    | CLIAgentEventType::PromptSubmit
++                    | CLIAgentEventType::ToolComplete
++            )
++        {
+             ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
+                 terminal_view_id,
+                 agent: session.agent,
+diff --git a/app/src/terminal/cli_agent_sessions/mod_tests.rs b/app/src/terminal/cli_agent_sessions/mod_tests.rs
+index 76ba27c..95a1721 100644
+--- a/app/src/terminal/cli_agent_sessions/mod_tests.rs
++++ b/app/src/terminal/cli_agent_sessions/mod_tests.rs
+@@ -1274,3 +1274,63 @@ fn second_ctrl_c_while_armed_reuses_the_existing_window() {
+         });
+     });
+ }
++
++#[test]
++fn session_start_clears_optimistic_in_progress() {
++    App::test((), |mut app| async move {
++        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
++        let view_id = EntityId::new();
++        model.update(&mut app, |m, ctx| {
++            m.set_session(
++                view_id,
++                cli_agent_session(CLIAgentSessionStatus::InProgress, false),
++                ctx,
++            );
++            m.update_from_event(view_id, &rich_event(CLIAgentEventType::SessionStart), ctx);
++        });
++        model.read(&app, |m, _| {
++            assert_eq!(
++                m.session(view_id).map(|s| &s.status),
++                Some(&CLIAgentSessionStatus::Success),
++                "a started agent waiting for its first prompt is not in progress"
++            );
++        });
++    });
++}
++
++#[test]
++fn idle_prompt_ends_a_turn_interrupted_without_stop() {
++    App::test((), |mut app| async move {
++        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
++        let view_id = EntityId::new();
++        model.update(&mut app, |m, ctx| {
++            m.set_session(
++                view_id,
++                cli_agent_session(CLIAgentSessionStatus::InProgress, true),
++                ctx,
++            );
++            m.update_from_event(view_id, &rich_event(CLIAgentEventType::PromptSubmit), ctx);
++            // Interrupted with Esc: no Stop, only the idle notification later.
++            m.update_from_event(view_id, &rich_event(CLIAgentEventType::IdlePrompt), ctx);
++        });
++        model.read(&app, |m, _| {
++            assert_eq!(
++                m.session(view_id).map(|s| &s.status),
++                Some(&CLIAgentSessionStatus::Cancelled)
++            );
++        });
++
++        // After a normal Stop, IdlePrompt leaves Success alone.
++        model.update(&mut app, |m, ctx| {
++            m.update_from_event(view_id, &rich_event(CLIAgentEventType::PromptSubmit), ctx);
++            m.update_from_event(view_id, &rich_event(CLIAgentEventType::Stop), ctx);
++            m.update_from_event(view_id, &rich_event(CLIAgentEventType::IdlePrompt), ctx);
++        });
++        model.read(&app, |m, _| {
++            assert_eq!(
++                m.session(view_id).map(|s| &s.status),
++                Some(&CLIAgentSessionStatus::Success)
++            );
++        });
++    });
++}
+diff --git a/app/src/terminal/view/link_detection.rs b/app/src/terminal/view/link_detection.rs
+index 259bd13..2969cb9 100644
+--- a/app/src/terminal/view/link_detection.rs
++++ b/app/src/terminal/view/link_detection.rs
+@@ -31,6 +31,7 @@ cfg_if::cfg_if! {
+             util::openable_file_type::FileTarget,
+         };
+         use warp_errors::report_error;
++        use crate::terminal::ShellLaunchData;
+     }
+ }
+ 
+@@ -704,6 +705,49 @@ impl super::TerminalView {
+         candidates
+     }
+ 
++    /// The link for the first candidate that exists on disk.
++    #[cfg(feature = "local_fs")]
++    fn first_existing_candidate(
++        working_directory: &str,
++        candidates: Vec<PathCandidate>,
++        possible_paths: &[WithinModel<grid_handler::PossiblePath>],
++        shell_launch_data: Option<&ShellLaunchData>,
++    ) -> Option<WithinModel<FileLink>> {
++        candidates.into_iter().find_map(|candidate| {
++            let absolute_path = absolute_path_if_valid(
++                &candidate.path,
++                ShellPathType::ShellNative(working_directory.to_owned()),
++                shell_launch_data,
++            )?;
++            let is_dir = absolute_path.is_dir();
++            Some(Self::create_valid_link(
++                absolute_path,
++                is_dir,
++                candidate,
++                possible_paths,
++            ))
++        })
++    }
++
++    /// Candidates and validation in one synchronous step, for tests.
++    #[cfg(all(test, feature = "local_fs"))]
++    pub(super) fn compute_valid_paths(
++        working_directory: &str,
++        possible_paths: impl Iterator<Item = WithinModel<grid_handler::PossiblePath>>,
++        max_columns: usize,
++        shell_launch_data: Option<ShellLaunchData>,
++    ) -> Option<GridHighlightedLink> {
++        let possible_paths: Vec<_> = possible_paths.collect();
++        let candidates = Self::path_candidates(&possible_paths, max_columns);
++        Self::first_existing_candidate(
++            working_directory,
++            candidates,
++            &possible_paths,
++            shell_launch_data.as_ref(),
++        )
++        .map(GridHighlightedLink::File)
++    }
++
+     /// Highlights the first candidate that exists, checking on a thread.
+     #[cfg(feature = "local_fs")]
+     fn validate_path_candidates(
+@@ -724,20 +768,12 @@ impl super::TerminalView {
+         self.file_link_scanning_join_handle = std::thread::Builder::new()
+             .name("Compute file paths".into())
+             .spawn(move || {
+-                let link = candidates.into_iter().find_map(|candidate| {
+-                    let absolute_path = absolute_path_if_valid(
+-                        &candidate.path,
+-                        ShellPathType::ShellNative(working_directory.clone()),
+-                        shell_launch_data.as_ref(),
+-                    )?;
+-                    let is_dir = absolute_path.is_dir();
+-                    Some(Self::create_valid_link(
+-                        absolute_path,
+-                        is_dir,
+-                        candidate,
+-                        &possible_paths,
+-                    ))
+-                });
++                let link = Self::first_existing_candidate(
++                    &working_directory,
++                    candidates,
++                    &possible_paths,
++                    shell_launch_data.as_ref(),
++                );
+                 let _ = tx.send(link.map(GridHighlightedLink::File));
+             })
+             .map_err(|e| {
