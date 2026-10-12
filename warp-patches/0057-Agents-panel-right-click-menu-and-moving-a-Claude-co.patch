@@ -1,0 +1,595 @@
+From 9e08cd0db33245653af1f9e3caaff21dc4f3597d Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Sun, 11 Oct 2026 18:04:27 -0700
+Subject: [PATCH 57/57] Agents panel right-click menu and moving a Claude
+ conversation to the host
+
+Right-clicking an Agents row offers: go to its Warp tab, open in the Claude Code
+extension, resume in a new Warp tab, and (for a Claude conversation running in a pane)
+move it to the extension. The vertical tabs' menu gets "Move to Claude Code extension"
+for a pane running Claude Code: Ctrl+C until the CLI exits, then the host opens it.
+warpPanelOpenAgentConversation takes a mode (default, editor, terminal).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/platform/wasm.rs                      |  12 +-
+ app/src/tab.rs                                |  33 +++
+ app/src/workspace/action.rs                   |   6 +
+ app/src/workspace/view.rs                     |  64 ++++++
+ app/src/workspace/view/agent_conversations.rs | 201 ++++++++++++++++--
+ app/src/workspace/view/left_panel.rs          |   4 +
+ 6 files changed, 299 insertions(+), 21 deletions(-)
+
+diff --git a/app/src/platform/wasm.rs b/app/src/platform/wasm.rs
+index 5e6d13f..75115e8 100644
+--- a/app/src/platform/wasm.rs
++++ b/app/src/platform/wasm.rs
+@@ -82,7 +82,11 @@ mod ffi {
+         ) -> Result<js_sys::Promise, JsValue>;
+ 
+         #[wasm_bindgen(js_name = "warpPanelOpenAgentConversation", catch)]
+-        pub fn open_agent_conversation(agent: &str, id: &str) -> Result<js_sys::Promise, JsValue>;
++        pub fn open_agent_conversation(
++            agent: &str,
++            id: &str,
++            mode: &str,
++        ) -> Result<js_sys::Promise, JsValue>;
+ 
+         #[wasm_bindgen(js_name = "warpPanelAgentConversationSeen", catch)]
+         pub fn agent_conversation_seen(agent: &str, id: &str) -> Result<(), JsValue>;
+@@ -165,8 +169,10 @@ pub fn agent_conversation_seen_in_host(agent: &str, id: &str) {
+     let _ = ffi::agent_conversation_seen(agent, id);
+ }
+ 
+-pub async fn open_agent_conversation_in_host(agent: &str, id: &str) -> Option<String> {
+-    let promise = ffi::open_agent_conversation(agent, id).ok()?;
++/// `mode`: "default" (the host's choice), "editor" (the host's editor tab, e.g. the Claude Code
++/// extension) or "terminal" (resume the agent's CLI: the host returns the command).
++pub async fn open_agent_conversation_in_host(agent: &str, id: &str, mode: &str) -> Option<String> {
++    let promise = ffi::open_agent_conversation(agent, id, mode).ok()?;
+     wasm_bindgen_futures::JsFuture::from(promise)
+         .await
+         .ok()?
+diff --git a/app/src/tab.rs b/app/src/tab.rs
+index b58ede4..6c33199 100644
+--- a/app/src/tab.rs
++++ b/app/src/tab.rs
+@@ -458,6 +458,7 @@ impl TabData {
+             self.tab_group_menu_items(index, tab_groups, is_only_member_of_group),
+             self.session_sharing_menu_items(index, ctx),
+             self.copy_metadata_menu_items(pane_name_target, ctx),
++            self.agent_menu_items(pane_name_target, ctx),
+             self.modify_tab_menu_items(index, can_move_left, can_move_right, pane_name_target, ctx),
+             self.close_tab_menu_items(index, tabs_len, ctx),
+             Self::save_config_menu_items(index),
+@@ -580,6 +581,38 @@ impl TabData {
+         })
+     }
+ 
++    /// Embedded builds: "Move to Claude Code extension" for a pane running a Claude Code
++    /// conversation Warp's plugin knows the id of.
++    fn agent_menu_items(
++        &self,
++        pane_name_target: Option<PaneNameMenuTarget>,
++        ctx: &AppContext,
++    ) -> Vec<MenuItem<WorkspaceAction>> {
++        if !cfg!(feature = "remote_tty") {
++            return vec![];
++        }
++        let pane_group = self.pane_group.as_ref(ctx);
++        let terminal_view = pane_name_target
++            .filter(|target| self.pane_group.id() == target.locator.pane_group_id)
++            .and_then(|target| pane_group.terminal_view_from_pane_id(target.locator.pane_id, ctx))
++            .or_else(|| pane_group.focused_session_view(ctx));
++        let Some(terminal_view_id) = terminal_view.map(|view| view.id()) else {
++            return vec![];
++        };
++        if crate::workspace::view::agent_conversations::claude_session_id(terminal_view_id, ctx)
++            .is_none()
++        {
++            return vec![];
++        }
++        vec![
++            MenuItemFields::new("Move to Claude Code extension")
++                .with_on_select_action(WorkspaceAction::MoveAgentConversationToHost {
++                    terminal_view_id,
++                })
++                .into_item(),
++        ]
++    }
++
+     fn copy_metadata_menu_items(
+         &self,
+         pane_name_target: Option<PaneNameMenuTarget>,
+diff --git a/app/src/workspace/action.rs b/app/src/workspace/action.rs
+index f415953..fade230 100644
+--- a/app/src/workspace/action.rs
++++ b/app/src/workspace/action.rs
+@@ -546,6 +546,11 @@ pub enum WorkspaceAction {
+     FocusTerminalViewInWorkspace {
+         terminal_view_id: EntityId,
+     },
++    /// Stops the Claude Code CLI running in this terminal view and opens its conversation in the
++    /// host's Claude Code extension (embedded builds).
++    MoveAgentConversationToHost {
++        terminal_view_id: EntityId,
++    },
+     /// Focus a specific pane by its locator (pane_group_id and pane_id).
+     FocusPane(PaneViewLocator),
+     /// Start a new AI conversation in a terminal view. This sets the pending query state
+@@ -1161,6 +1166,7 @@ impl WorkspaceAction {
+             | OpenAIFactCollection
+             | OpenMCPServerCollection
+             | FocusTerminalViewInWorkspace { .. }
++            | MoveAgentConversationToHost { .. }
+             | FocusPane(..)
+             | ShiftSelectTabRange { .. }
+             | ToggleTabMultiSelection { .. }
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index a96eb2c..e56118a 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -41,6 +41,10 @@ use std::path::{Path, PathBuf};
+ use std::process;
+ use std::sync::{Arc, Mutex, mpsc};
+ use std::time::Duration;
++
++use warpui::r#async::Timer;
++
++use self::agent_conversations::claude_session_id;
+ #[cfg(target_os = "macos")]
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+@@ -6051,6 +6055,60 @@ impl Workspace {
+ 
+     /// Searches this workspace's tabs for the given terminal view and focuses it.
+     /// Returns true if the terminal view was found and focused.
++    /// Moves the Claude Code conversation running in a pane to the host's Claude Code extension:
++    /// Ctrl+C until the CLI has exited (one interrupts a running turn, two more quit), so the
++    /// conversation is never written by two at once, then the host opens it in its editor tab.
++    /// The pane's shell stays.
++    fn move_agent_conversation_to_host(
++        &mut self,
++        terminal_view_id: EntityId,
++        ctx: &mut ViewContext<Self>,
++    ) {
++        let Some(session_id) = claude_session_id(terminal_view_id, ctx) else {
++            return;
++        };
++        let terminal_view = self.tabs.iter().find_map(|tab| {
++            let pane_group = tab.pane_group.as_ref(ctx);
++            pane_group
++                .find_pane_id_for_terminal_view(terminal_view_id, ctx)
++                .and_then(|pane_id| pane_group.terminal_view_from_pane_id(pane_id, ctx))
++        });
++        let Some(terminal_view) = terminal_view else {
++            return;
++        };
++        Self::stop_agent_then_open_in_host(terminal_view, session_id, 10, ctx);
++    }
++
++    fn stop_agent_then_open_in_host(
++        terminal_view: ViewHandle<TerminalView>,
++        session_id: String,
++        attempts_left: u32,
++        ctx: &mut ViewContext<Self>,
++    ) {
++        let running = claude_session_id(terminal_view.id(), ctx).as_deref() == Some(&session_id);
++        if !running || attempts_left == 0 {
++            #[cfg(target_family = "wasm")]
++            ctx.spawn(
++                async move {
++                    crate::platform::wasm::open_agent_conversation_in_host(
++                        "claude",
++                        &session_id,
++                        "editor",
++                    )
++                    .await
++                },
++                |_, _, _| {},
++            );
++            return;
++        }
++        terminal_view.update(ctx, |view, ctx| {
++            view.write_user_bytes_to_pty(vec![crate::terminal::model::escape_sequences::C0::ETX], ctx);
++        });
++        ctx.spawn(Timer::after(Duration::from_millis(400)), move |_, _, ctx| {
++            Self::stop_agent_then_open_in_host(terminal_view, session_id, attempts_left - 1, ctx);
++        });
++    }
++
+     fn focus_terminal_view_locally(
+         &mut self,
+         terminal_view_id: EntityId,
+@@ -6794,6 +6852,9 @@ impl Workspace {
+                     ctx,
+                 );
+             }
++            LeftPanelEvent::MoveAgentConversationToHost(terminal_view_id) => {
++                self.move_agent_conversation_to_host(*terminal_view_id, ctx);
++            }
+             LeftPanelEvent::FocusTerminalView(terminal_view_id) => {
+                 self.handle_action(
+                     &WorkspaceAction::FocusTerminalViewInWorkspace {
+@@ -25763,6 +25824,9 @@ impl TypedActionView for Workspace {
+                     self.focus_terminal_view_in_other_window(*terminal_view_id, ctx);
+                 }
+             }
++            MoveAgentConversationToHost { terminal_view_id } => {
++                self.move_agent_conversation_to_host(*terminal_view_id, ctx);
++            }
+             FocusPane(locator) => {
+                 self.focus_pane(*locator, ctx);
+             }
+diff --git a/app/src/workspace/view/agent_conversations.rs b/app/src/workspace/view/agent_conversations.rs
+index 77ee022..46d2a72 100644
+--- a/app/src/workspace/view/agent_conversations.rs
++++ b/app/src/workspace/view/agent_conversations.rs
+@@ -7,6 +7,8 @@
+ //! (clicking it goes to that tab); for one elsewhere (the Claude Code extension, another
+ //! terminal), the host's state from the agent's session file, which it clears once you open the
+ //! conversation. The list is reloaded every few seconds so the dots stay current.
++//! Right-clicking a row picks where it opens: the host's editor tab (Claude Code's extension) or
++//! the agent's CLI resumed in a new Warp tab.
+ 
+ use std::collections::HashMap;
+ use std::ops::Range;
+@@ -14,24 +16,28 @@ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+-use pathfinder_geometry::vector::vec2f;
++use pathfinder_geometry::vector::{Vector2F, vec2f};
+ use warp_core::ui::theme::Fill as ThemeFill;
+ use warp_util::path::user_friendly_path;
+ use warpui::r#async::{SpawnedFutureHandle, Timer};
+ use warpui::elements::{
+-    Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
++    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+     DispatchEventResult, DropShadow, Element, EventHandler, Fill, Flex, Hoverable,
+     MainAxisAlignment, MainAxisSize, MouseInBehavior, MouseStateHandle, OffsetPositioning,
+     ParentAnchor, ParentElement, ParentOffsetBounds, Radius, ScrollStateHandle, Scrollable,
+-    ScrollableElement, ScrollbarWidth, Shrinkable, Stack, Text, UniformList, UniformListState,
++    SavePosition, ScrollableElement, ScrollbarWidth, Shrinkable, Stack, Text, UniformList,
++    UniformListState,
+ };
+ use warpui::platform::Cursor;
+-use warpui::{AppContext, Entity, EntityId, SingletonEntity, TypedActionView, View, ViewContext};
++use warpui::{
++    AppContext, Entity, EntityId, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
++};
+ 
+ use crate::ai::agent::conversation::ConversationStatus;
+ use crate::ai::agent_management::AgentNotificationsModel;
+ use crate::ai::blocklist::CLAUDE_ORANGE;
+ use crate::appearance::Appearance;
++use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
+ use crate::terminal::cli_agent::{CLIAgent, GEMINI_BLUE};
+ use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
+ use crate::ui_components::icon_with_status::{IconWithStatusVariant, render_icon_with_status};
+@@ -88,11 +94,37 @@ struct Summary {
+     error: Option<String>,
+ }
+ 
++/// Where a conversation opens.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum OpenTarget {
++    /// The Warp pane it runs in, else the host's choice (Claude Code: its editor tab).
++    Default,
++    /// The host's editor tab (the Claude Code extension), even with a Warp pane running it.
++    HostEditor,
++    /// The agent's CLI, resumed in a new Warp tab.
++    Terminal,
++}
++
++impl OpenTarget {
++    /// The mode the host's `warpPanelOpenAgentConversation` takes.
++    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
++    fn host_mode(self) -> &'static str {
++        match self {
++            Self::Default => "default",
++            Self::HostEditor => "editor",
++            Self::Terminal => "terminal",
++        }
++    }
++}
++
+ #[derive(Clone, Debug)]
+ pub enum AgentConversationsAction {
+     SetHoveredIndex(usize),
+     ClearHoveredIndex,
+     Open(usize),
++    OpenWith(usize, OpenTarget),
++    OpenContextMenu { index: usize, position: Vector2F },
++    MoveToHost(EntityId),
+ }
+ 
+ pub enum AgentConversationsEvent {
+@@ -101,6 +133,8 @@ pub enum AgentConversationsEvent {
+     /// Run this command in a new terminal tab (resumes an agent that runs in a terminal).
+     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+     RunInNewTab(String),
++    /// Move the Claude Code conversation in this Warp pane to the host's extension.
++    MoveToHost(EntityId),
+ }
+ 
+ pub struct AgentConversationsView {
+@@ -119,6 +153,10 @@ pub struct AgentConversationsView {
+     /// The host's last answer, to skip redrawing when nothing changed.
+     last_json: Option<String>,
+     refresh_timer: Option<SpawnedFutureHandle>,
++    context_menu: ViewHandle<Menu<AgentConversationsAction>>,
++    /// Where the open context menu is, relative to this view.
++    context_menu_position: Option<Vector2F>,
++    position_id: String,
+ }
+ 
+ impl AgentConversationsView {
+@@ -141,7 +179,21 @@ impl AgentConversationsView {
+             }
+             me.rebuild_rows(ctx);
+         });
++        let context_menu = ctx.add_typed_action_view(|_| {
++            Menu::new()
++                .prevent_interaction_with_other_elements()
++                .with_drop_shadow()
++        });
++        ctx.subscribe_to_view(&context_menu, |me, _, event, ctx| {
++            if let MenuEvent::Close { .. } = event {
++                me.context_menu_position = None;
++                ctx.notify();
++            }
++        });
+         Self {
++            context_menu,
++            context_menu_position: None,
++            position_id: format!("agent_conversations_{}", ctx.view_id()),
+             conversations: Vec::new(),
+             host_conversations: Vec::new(),
+             loaded: false,
+@@ -345,7 +397,73 @@ impl AgentConversationsView {
+         }
+     }
+ 
+-    fn open(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
++    /// The Warp pane this row's agent runs in, if any.
++    fn pane_view_id(&self, index: usize, app: &AppContext) -> Option<EntityId> {
++        let conversation = self.conversations.get(index)?;
++        match conversation.pane_only {
++            Some((terminal_view_id, _)) => Some(terminal_view_id),
++            None => warp_panes(app)
++                .iter()
++                .find(|pane| pane.matches(&conversation.agent, &conversation.id))
++                .map(|pane| pane.terminal_view_id),
++        }
++    }
++
++    fn open_context_menu(&mut self, index: usize, position: Vector2F, ctx: &mut ViewContext<Self>) {
++        let Some(conversation) = self.conversations.get(index) else {
++            return;
++        };
++        let mut items: Vec<MenuItem<AgentConversationsAction>> = Vec::new();
++        let pane_view_id = self.pane_view_id(index, ctx);
++        if let Some(terminal_view_id) = pane_view_id {
++            items.push(
++                MenuItemFields::new("Go to its Warp tab")
++                    .with_on_select_action(AgentConversationsAction::OpenWith(
++                        index,
++                        OpenTarget::Default,
++                    ))
++                    .into_item(),
++            );
++            if claude_session_id(terminal_view_id, ctx).is_some() {
++                items.push(
++                    MenuItemFields::new("Move to Claude Code extension")
++                        .with_on_select_action(AgentConversationsAction::MoveToHost(
++                            terminal_view_id,
++                        ))
++                        .into_item(),
++                );
++            }
++        } else if conversation.pane_only.is_none() {
++            if conversation.agent == "claude" {
++                items.push(
++                    MenuItemFields::new("Open in Claude Code extension")
++                        .with_on_select_action(AgentConversationsAction::OpenWith(
++                            index,
++                            OpenTarget::HostEditor,
++                        ))
++                        .into_item(),
++                );
++            }
++            items.push(
++                MenuItemFields::new("Resume in new Warp tab")
++                    .with_on_select_action(AgentConversationsAction::OpenWith(
++                        index,
++                        OpenTarget::Terminal,
++                    ))
++                    .into_item(),
++            );
++        }
++        self.set_hovered_index(None, ctx);
++        self.context_menu_position = Some(position);
++        self.context_menu.update(ctx, move |menu, ctx| {
++            menu.set_items(items, ctx);
++            ctx.notify();
++        });
++        ctx.notify();
++    }
++
++    fn open(&mut self, index: usize, target: OpenTarget, ctx: &mut ViewContext<Self>) {
++        self.context_menu_position = None;
+         let Some(conversation) = self.conversations.get_mut(index) else {
+             return;
+         };
+@@ -354,15 +472,9 @@ impl AgentConversationsView {
+             conversation.unread = false;
+             ctx.notify();
+         }
++        let pane_view_id = self.pane_view_id(index, ctx);
+         let conversation = &self.conversations[index];
+-        let pane_view_id = match conversation.pane_only {
+-            Some((terminal_view_id, _)) => Some(terminal_view_id),
+-            None => warp_panes(ctx)
+-                .iter()
+-                .find(|pane| pane.matches(&conversation.agent, &conversation.id))
+-                .map(|pane| pane.terminal_view_id),
+-        };
+-        if let Some(terminal_view_id) = pane_view_id {
++        if let Some(terminal_view_id) = pane_view_id.filter(|_| target == OpenTarget::Default) {
+             ctx.emit(AgentConversationsEvent::FocusTerminalView(terminal_view_id));
+             return;
+         }
+@@ -372,7 +484,12 @@ impl AgentConversationsView {
+             let id = conversation.id.clone();
+             ctx.spawn(
+                 async move {
+-                    crate::platform::wasm::open_agent_conversation_in_host(&agent, &id).await
++                    crate::platform::wasm::open_agent_conversation_in_host(
++                        &agent,
++                        &id,
++                        target.host_mode(),
++                    )
++                    .await
+                 },
+                 |_, command, ctx| {
+                     if let Some(command) = command.filter(|command| !command.is_empty()) {
+@@ -382,7 +499,7 @@ impl AgentConversationsView {
+             );
+         }
+         #[cfg(not(target_family = "wasm"))]
+-        let _ = (conversation, ctx);
++        let _ = (conversation, target, ctx);
+     }
+ }
+ 
+@@ -399,7 +516,16 @@ impl TypedActionView for AgentConversationsView {
+                 self.set_hovered_index(Some(*index), ctx)
+             }
+             AgentConversationsAction::ClearHoveredIndex => self.set_hovered_index(None, ctx),
+-            AgentConversationsAction::Open(index) => self.open(*index, ctx),
++            AgentConversationsAction::Open(index) => self.open(*index, OpenTarget::Default, ctx),
++            AgentConversationsAction::OpenWith(index, target) => self.open(*index, *target, ctx),
++            AgentConversationsAction::OpenContextMenu { index, position } => {
++                self.open_context_menu(*index, *position, ctx)
++            }
++            AgentConversationsAction::MoveToHost(terminal_view_id) => {
++                self.context_menu_position = None;
++                ctx.emit(AgentConversationsEvent::MoveToHost(*terminal_view_id));
++                ctx.notify();
++            }
+         }
+     }
+ }
+@@ -425,6 +551,20 @@ impl WarpPane {
+ }
+ 
+ /// The host's name for a CLI agent, as in `HostAgentConversation::agent`.
++/// The id of the Claude Code conversation running in this terminal view, when Warp's Claude Code
++/// plugin reports one: what moving it to the host's Claude Code extension needs.
++pub(crate) fn claude_session_id(terminal_view_id: EntityId, app: &AppContext) -> Option<String> {
++    let session = CLIAgentSessionsModel::as_ref(app).session(terminal_view_id)?;
++    if !matches!(session.agent, CLIAgent::Claude) {
++        return None;
++    }
++    session
++        .session_context
++        .session_id
++        .clone()
++        .filter(|id| !id.is_empty())
++}
++
+ fn host_agent_name(agent: CLIAgent) -> Option<&'static str> {
+     match agent {
+         CLIAgent::Claude => Some("claude"),
+@@ -564,6 +704,7 @@ fn render_row(
+     unread: bool,
+     status: Option<ConversationStatus>,
+     mouse_state: MouseStateHandle,
++    position_id: String,
+     app: &AppContext,
+ ) -> Box<dyn Element> {
+     let appearance = Appearance::as_ref(app);
+@@ -690,6 +831,15 @@ fn render_row(
+     .on_click(move |ctx, _, _| {
+         ctx.dispatch_typed_action(AgentConversationsAction::Open(index));
+     })
++    .on_right_click(move |ctx, _, position| {
++        let Some(bounds) = ctx.element_position_by_id(&position_id) else {
++            return;
++        };
++        ctx.dispatch_typed_action(AgentConversationsAction::OpenContextMenu {
++            index,
++            position: position - bounds.origin(),
++        });
++    })
+     .finish();
+ 
+     EventHandler::new(row)
+@@ -765,6 +915,7 @@ impl View for AgentConversationsView {
+             .cloned();
+         let hovered_index = self.hovered_index;
+         let row_states = self.row_states.clone();
++        let position_id = self.position_id.clone();
+         let list = UniformList::new(
+             self.list_state.clone(),
+             self.conversations.len(),
+@@ -782,6 +933,7 @@ impl View for AgentConversationsView {
+                             states[index].0,
+                             states[index].1.clone(),
+                             row_states[index].clone(),
++                            position_id.clone(),
+                             app,
+                         ))
+                     })
+@@ -802,13 +954,26 @@ impl View for AgentConversationsView {
+         .with_overlayed_scrollbar()
+         .finish();
+ 
+-        Hoverable::new(self.list_hover.clone(), move |_| scrollable)
++        let list = Hoverable::new(self.list_hover.clone(), move |_| scrollable)
+             .on_hover(|is_hovered, ctx, _, _| {
+                 if !is_hovered {
+                     ctx.dispatch_typed_action(AgentConversationsAction::ClearHoveredIndex);
+                 }
+             })
+             .with_skip_synthetic_hover_out()
+-            .finish()
++            .finish();
++        let mut stack = Stack::new().with_child(SavePosition::new(list, &self.position_id).finish());
++        if let Some(position) = self.context_menu_position {
++            stack.add_positioned_overlay_child(
++                ChildView::new(&self.context_menu).finish(),
++                OffsetPositioning::offset_from_parent(
++                    position,
++                    ParentOffsetBounds::WindowByPosition,
++                    ParentAnchor::TopLeft,
++                    ChildAnchor::TopLeft,
++                ),
++            );
++        }
++        stack.finish()
+     }
+ }
+diff --git a/app/src/workspace/view/left_panel.rs b/app/src/workspace/view/left_panel.rs
+index dc3b3b8..e9df6cd 100644
+--- a/app/src/workspace/view/left_panel.rs
++++ b/app/src/workspace/view/left_panel.rs
+@@ -150,6 +150,7 @@ pub enum LeftPanelEvent {
+     SignInRequested,
+     /// Run this command in a new terminal tab.
+     RunCommandInNewTab(String),
++    MoveAgentConversationToHost(warpui::EntityId),
+     /// Show the terminal pane with this view (from the Agents panel).
+     FocusTerminalView(warpui::EntityId),
+ }
+@@ -386,6 +387,9 @@ impl LeftPanelView {
+                 AgentConversationsEvent::FocusTerminalView(terminal_view_id) => {
+                     ctx.emit(LeftPanelEvent::FocusTerminalView(*terminal_view_id));
+                 }
++                AgentConversationsEvent::MoveToHost(terminal_view_id) => {
++                    ctx.emit(LeftPanelEvent::MoveAgentConversationToHost(*terminal_view_id));
++                }
+             },
+         );
+ 

@@ -480,9 +480,10 @@ class AgentConversations {
   /**
    * Opens a conversation. Claude Code ones open in its VS Code editor tab (in a new window for
    * another folder) and this returns undefined; Codex and Gemini ones return the shell command
-   * that resumes them, for Warp to run in a new tab.
+   * that resumes them, for Warp to run in a new tab. `mode` "terminal" returns the resume
+   * command for Claude too; "editor" insists on the Claude Code extension.
    */
-  async open(agent, id) {
+  async open(agent, id, mode = 'default') {
     const entry = this.entry(agent, id);
     this.markSeen(agent, id);
     const parsed = this.parsed.get(`${entry.file}\0${entry.mtimeMs}`) || AGENTS[agent].parse(entry, new Map());
@@ -491,7 +492,21 @@ class AgentConversations {
     if (agent === 'codex') return `${cd}codex resume ${shellQuote(id)}`;
     if (agent === 'gemini') return `${cd}gemini --resume ${shellQuote(id)}`;
 
+    if (mode === 'terminal') {
+      // A move: its Claude Code tab here closes, so two never write to it at once.
+      const title = normalizeTitle(parsed?.title);
+      const tabs = vscode.window.tabGroups.all
+        .flatMap((group) => group.tabs)
+        .filter((tab) => tab.input instanceof vscode.TabInputWebview && /claudeVSCodePanel$/.test(tab.input.viewType))
+        .filter((tab) => {
+          const label = normalizeTitle(tab.label);
+          return title && label && (title.startsWith(label) || label.startsWith(title));
+        });
+      if (tabs.length) await vscode.window.tabGroups.close(tabs);
+      return `${cd}claude --resume ${shellQuote(id)}`;
+    }
     if (!vscode.extensions.getExtension('anthropic.claude-code')) {
+      if (mode === 'editor') throw new Error('The Claude Code extension is not installed');
       return `${cd}claude --resume ${shellQuote(id)}`;
     }
     const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);

@@ -283,7 +283,7 @@ class WarpViewProvider {
             );
             reply({});
           } else {
-            reply({ value: await this.agents.open(agent, sessionId) });
+            reply({ value: await this.agents.open(agent, sessionId, String(msg.mode || 'default')) });
           }
         } catch (error) {
           if (error.message !== 'cancelled') this.log.appendLine(`agents: ${msg.type}: ${error.message}`);
