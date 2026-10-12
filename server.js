@@ -31,7 +31,7 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { execFile } = require('child_process');
-const { WebSocketServer } = require('ws');
+const { WebSocket, WebSocketServer } = require('ws');
 // node-pty is native code: loaded only in the PTY host (on the first spawn), never in VS Code's
 // extension host, which shares its process with other extensions (e.g. Claude Code) and loads
 // this file for shellLaunch/wasmEtag. Replacing the extension under a loaded addon crashed it.
@@ -39,6 +39,15 @@ let pty;
 const { ShellRecorder } = require('./shellRecorder');
 
 const HOST = '127.0.0.1';
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 const HOST_PAGE = path.join(__dirname, 'media', 'host.html');
 // Warp normally loads fallback fonts (e.g. ⌘⇧⌥ from Noto Sans Symbols 2) from app.warp.dev, which
 // CORS blocks for us; our Warp build requests them from this server instead.
@@ -219,6 +228,8 @@ async function startServer({
   cwd = process.env.HOME,
   shell = process.env.SHELL || '/bin/zsh',
   log = console.log,
+  // PTY hosts of earlier extension builds ({pid, ptyBaseUrl}) whose shells a page may still want.
+  previousHosts = [],
 }) {
   ensureSpawnHelperExecutable();
   const defaultLaunch = shellLaunch(shell);
@@ -272,7 +283,29 @@ async function startServer({
         log(`session ${previous.term.pid} can't be taken over; ending it`);
         previous.term.kill();
       }
+      // After an update the pane's shell may still run in the previous build's PTY host.
+      if (!previous && previousHosts.some((host) => isAlive(host.pid))) {
+        // The page talks right away (its size); kept until it's clear who gets it.
+        const early = [];
+        const keep = (data, isBinary) => early.push([data, isBinary]);
+        ws.on('message', keep);
+        proxyToPreviousHost(ws, url).then((proxied) => {
+          ws.off('message', keep);
+          if (proxied) {
+            for (const [data, isBinary] of early) proxied.send(data, { binary: isBinary });
+            return;
+          }
+          if (ws.readyState !== WebSocket.OPEN) return;
+          spawnShell(ws, url, pane);
+          for (const [data, isBinary] of early) ws.emit('message', data, isBinary);
+        });
+        return;
+      }
     }
+    spawnShell(ws, url, pane);
+  });
+
+  function spawnShell(ws, url, pane) {
 
     const launch = url.searchParams.get('shell_path') ? shellLaunch(url.searchParams.get('shell_path')) : defaultLaunch;
     const rows = Number(url.searchParams.get('num_rows')) || 24;
@@ -342,7 +375,65 @@ async function startServer({
     session.debug = debug;
     attach(session, ws);
     ws.send(JSON.stringify({ session: session.id }));
-  });
+  }
+
+  /** Page connections passed through to a previous PTY host. */
+  const proxies = new Set();
+
+  /**
+   * Asks the previous builds' PTY hosts for the page's pane. A host that still has the shell
+   * detached hands it over (its first message is `adopt`) and the connection is passed through;
+   * one that doesn't starts a fresh shell (first message `session`), which is ended right away.
+   * Resolves to the previous host's socket, or null.
+   */
+  async function proxyToPreviousHost(ws, url) {
+    for (const host of previousHosts) {
+      if (!isAlive(host.pid) || ws.readyState !== WebSocket.OPEN) continue;
+      const target = new URL(host.ptyBaseUrl);
+      for (const [name, value] of url.searchParams) if (name !== 'token') target.searchParams.set(name, value);
+      const old = new WebSocket(target);
+      const first = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), 3000);
+        const done = (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        };
+        old.once('message', (data, isBinary) => done(isBinary ? null : data.toString()));
+        old.once('error', () => done(null));
+        old.once('close', () => done(null));
+      });
+      let message = null;
+      try {
+        message = JSON.parse(first);
+      } catch {}
+      if (!message?.adopt || ws.readyState !== WebSocket.OPEN) {
+        if (message?.session && old.readyState === WebSocket.OPEN) old.send(Buffer.from('exit\r'));
+        old.close();
+        continue;
+      }
+      log(`pane ${url.searchParams.get('pane')}: passing through to the previous PTY host ${host.pid}`);
+      ws.send(first);
+      old.on('message', (data, isBinary) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(data, { binary: isBinary });
+      });
+      ws.on('message', (data, isBinary) => {
+        if (old.readyState === WebSocket.OPEN) old.send(data, { binary: isBinary });
+      });
+      const entry = { ws, old };
+      proxies.add(entry);
+      // The previous host keeps the shell detached for its own timeout when the page goes away.
+      ws.on('close', () => {
+        proxies.delete(entry);
+        old.close();
+      });
+      old.on('close', (code, reason) => {
+        proxies.delete(entry);
+        if (ws.readyState === WebSocket.OPEN) ws.close(code >= 3000 && code < 5000 ? code : 1000, reason);
+      });
+      return old;
+    }
+    return null;
+  }
 
   // Hands a reloaded page its pane's running shell (see "Adoption" at the top). Returns false if
   // the shell can't be taken over (it hadn't finished bootstrapping, or printed too much then).
@@ -493,11 +584,17 @@ async function startServer({
     /** Running shells, how many pages show one, and when a page last made a request. */
     stats() {
       const all = [...sessions.values()];
-      return { sessions: all.length, attached: all.filter((s) => isOpen(s.ws)).length, lastActivity };
+      // A passed-through shell counts as one of ours.
+      return {
+        sessions: all.length + proxies.size,
+        attached: all.filter((s) => isOpen(s.ws)).length + proxies.size,
+        lastActivity,
+      };
     },
     /** Drops every page connection without ending the shells, like a network change does (tests). */
     dropConnections() {
       for (const { ws } of sessions.values()) ws?.terminate();
+      for (const { ws } of proxies) ws.terminate();
     },
     close() {
       for (const { term, expiry } of sessions.values()) {

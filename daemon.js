@@ -15,6 +15,11 @@ const stateFile = process.env.WARP_PANEL_STATE;
 const bundleDir = process.env.WARP_PANEL_BUNDLE_DIR;
 const key = process.env.WARP_PANEL_KEY;
 const nonce = process.env.WARP_PANEL_NONCE;
+// Earlier builds' PTY hosts, whose shells pages may still take over (see ptyHost.js).
+let previousHosts = [];
+try {
+  previousHosts = JSON.parse(process.env.WARP_PANEL_PREVIOUS || '[]');
+} catch {}
 // The shells get the environment VS Code gave the extension, without the variable that made this
 // process plain Node (Electron apps started from a shell would otherwise do the same).
 delete process.env.ELECTRON_RUN_AS_NODE;
@@ -43,6 +48,7 @@ async function main() {
     bundleDir,
     token: crypto.randomBytes(32).toString('hex'),
     staticPort: Number(process.env.WARP_PANEL_STATIC_PORT) || 0,
+    previousHosts,
     log,
   });
   writeState({
@@ -52,8 +58,10 @@ async function main() {
     pageUrl: server.pageUrl,
     staticOrigin: server.staticOrigin,
     ptyBaseUrl: server.ptyBaseUrl,
+    previous: previousHosts,
   });
   log(`PTY host ${process.pid} serving ${bundleDir} at ${server.pageUrl}`);
+  if (previousHosts.length) log(`previous PTY hosts: ${previousHosts.map((host) => host.pid).join(', ')}`);
 
   let idleSince = Date.now();
   setInterval(() => {

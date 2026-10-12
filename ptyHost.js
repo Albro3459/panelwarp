@@ -41,6 +41,15 @@ function readState(file) {
   }
 }
 
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether the PTY host from `state` is running and accepting connections. */
 function isRunning(state) {
   try {
@@ -81,6 +90,13 @@ async function ensurePtyHost({ storageDir, bundleDir, staticPort = 0, log }) {
   const key = buildKey(bundleDir);
   const existing = readState(stateFile);
   if (existing?.key === key && (await isRunning(existing))) return existing;
+  // An update starts a new PTY host; the running one (and the ones it took over from) keep their
+  // shells, which pages take over through the new one.
+  const previous = existing && existing.key !== key ? [existing, ...(existing.previous || [])] : [];
+  const previousHosts = previous
+    .filter((host) => host.pid && host.ptyBaseUrl && pidAlive(host.pid))
+    .map(({ pid, ptyBaseUrl }) => ({ pid, ptyBaseUrl }))
+    .slice(0, 5);
 
   const logFile = path.join(storageDir, LOG_FILE);
   const nonce = crypto.randomBytes(16).toString('hex');
@@ -98,6 +114,7 @@ async function ensurePtyHost({ storageDir, bundleDir, staticPort = 0, log }) {
       WARP_PANEL_KEY: key,
       WARP_PANEL_NONCE: nonce,
       WARP_PANEL_STATIC_PORT: String(staticPort || 0),
+      WARP_PANEL_PREVIOUS: JSON.stringify(previousHosts),
     },
   });
   child.unref();
