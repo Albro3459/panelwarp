@@ -23,6 +23,14 @@ SRC="$WARP_SRC/target/wasm32-unknown-unknown/$PROFILE/bundle"
 PREBUILDS=node_modules/node-pty/prebuilds
 [ -d "$PREBUILDS/$TARGET" ] || { echo "no node-pty prebuild for $TARGET"; exit 2; }
 [ -f "$SRC/wasm/warp.js" ] || { echo "no Warp bundle at $SRC"; exit 2; }
+# This script doesn't build Warp; refuse a bundle older than the fork's newest commit.
+WARP_COMMIT_TIME=$(git -C "$WARP_SRC" log -1 --format=%ct)
+BUNDLE_TIME=$(stat -f %m "$SRC/wasm/warp_bg.wasm" 2>/dev/null || stat -c %Y "$SRC/wasm/warp_bg.wasm")
+if [ "$BUNDLE_TIME" -lt "$WARP_COMMIT_TIME" ] && [ -z "${ALLOW_STALE_BUNDLE:-}" ]; then
+  echo "the $PROFILE bundle is older than Warp's newest commit; run scripts/build-warp.sh first" \
+    "(or ALLOW_STALE_BUNDLE=1)"
+  exit 2
+fi
 
 "$PWD/scripts/export-warp-patches.sh" >/dev/null
 OUT="$PWD/panelwarp-$TARGET.vsix"
