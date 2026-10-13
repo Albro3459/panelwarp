@@ -376,6 +376,9 @@
           { type: 'warp-agents-open', agent: String(agent), sessionId: String(id), mode: String(mode || 'default') },
           30000,
         );
+      // Moves a conversation's session file to the Trash; rejects with an error message.
+      window.warpPanelTrashAgentConversation = (agent, id) =>
+        agentsRequest({ type: 'warp-agents-trash', agent: String(agent), sessionId: String(id) }, 30000);
       window.addEventListener('message', (e) => {
         if (e.source !== window.parent) return;
         const pending = pendingAgents.get(e.data?.id);

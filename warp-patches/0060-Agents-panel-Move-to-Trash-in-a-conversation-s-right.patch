@@ -1,0 +1,121 @@
+From 62fb80a4efc86114324abc458fda5aeaba99834e Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Mon, 12 Oct 2026 21:22:20 -0700
+Subject: [PATCH 60/60] Agents panel: Move to Trash in a conversation's
+ right-click menu
+
+The host moves the conversation's session file (and Claude Code's folder of
+subagent transcripts next to it) to the Trash; its row goes right away and
+comes back on the next list if that failed. Not offered while a turn runs
+or for agents in Warp's own panes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/platform/wasm.rs                      | 13 ++++++
+ app/src/workspace/view/agent_conversations.rs | 41 +++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/app/src/platform/wasm.rs b/app/src/platform/wasm.rs
+index 75115e8..682aa36 100644
+--- a/app/src/platform/wasm.rs
++++ b/app/src/platform/wasm.rs
+@@ -88,6 +88,9 @@ mod ffi {
+             mode: &str,
+         ) -> Result<js_sys::Promise, JsValue>;
+ 
++        #[wasm_bindgen(js_name = "warpPanelTrashAgentConversation", catch)]
++        pub fn trash_agent_conversation(agent: &str, id: &str) -> Result<js_sys::Promise, JsValue>;
++
+         #[wasm_bindgen(js_name = "warpPanelAgentConversationSeen", catch)]
+         pub fn agent_conversation_seen(agent: &str, id: &str) -> Result<(), JsValue>;
+ 
+@@ -179,6 +182,16 @@ pub async fn open_agent_conversation_in_host(agent: &str, id: &str, mode: &str)
+         .as_string()
+ }
+ 
++/// Asks the host to move a conversation's session file to the Trash.
++pub async fn trash_agent_conversation_in_host(agent: &str, id: &str) -> Result<(), String> {
++    let promise = ffi::trash_agent_conversation(agent, id)
++        .map_err(|_| "not supported by the host".to_owned())?;
++    wasm_bindgen_futures::JsFuture::from(promise)
++        .await
++        .map(|_| ())
++        .map_err(|err| err.as_string().unwrap_or_else(|| "failed".to_owned()))
++}
++
+ #[derive(serde::Deserialize)]
+ struct HostGeneratedCommand {
+     command: String,
+diff --git a/app/src/workspace/view/agent_conversations.rs b/app/src/workspace/view/agent_conversations.rs
+index df233ed..bf262a5 100644
+--- a/app/src/workspace/view/agent_conversations.rs
++++ b/app/src/workspace/view/agent_conversations.rs
+@@ -127,6 +127,8 @@ pub enum AgentConversationsAction {
+     OpenWith(usize, OpenTarget),
+     OpenContextMenu { index: usize, position: Vector2F },
+     MoveToHost(EntityId),
++    /// Moves the conversation's session file to the Trash.
++    Trash(usize),
+ }
+ 
+ pub enum AgentConversationsEvent {
+@@ -449,6 +451,15 @@ impl AgentConversationsView {
+                     ))
+                     .into_item(),
+             );
++            // Not while a turn runs: the agent would write the file again.
++            if conversation.status.as_deref() != Some("working") {
++                items.push(MenuItem::Separator);
++                items.push(
++                    MenuItemFields::new("Move to Trash")
++                        .with_on_select_action(AgentConversationsAction::Trash(index))
++                        .into_item(),
++                );
++            }
+         }
+         self.set_hovered_index(None, ctx);
+         self.summary_index = None;
+@@ -460,6 +471,35 @@ impl AgentConversationsView {
+         ctx.notify();
+     }
+ 
++    /// Moves a conversation's session file to the Trash through the host. Its row goes right away;
++    /// the next list from the host brings it back if that failed.
++    fn trash(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
++        self.context_menu_position = None;
++        let Some(conversation) = self.conversations.get(index) else {
++            return;
++        };
++        let (agent, id) = (conversation.agent.clone(), conversation.id.clone());
++        self.host_conversations
++            .retain(|row| !(row.agent == agent && row.id == id));
++        self.summary_index = None;
++        self.rebuild_rows(ctx);
++        #[cfg(target_family = "wasm")]
++        ctx.spawn(
++            async move {
++                crate::platform::wasm::trash_agent_conversation_in_host(&agent, &id).await
++            },
++            |me, result, ctx| {
++                if let Err(error) = result {
++                    log::warn!("Couldn't move the conversation to the Trash: {error}");
++                }
++                me.last_json = None;
++                me.refresh(ctx);
++            },
++        );
++        #[cfg(not(target_family = "wasm"))]
++        let _ = (agent, id);
++    }
++
+     fn open(&mut self, index: usize, target: OpenTarget, ctx: &mut ViewContext<Self>) {
+         self.context_menu_position = None;
+         let Some(conversation) = self.conversations.get_mut(index) else {
+@@ -520,6 +560,7 @@ impl TypedActionView for AgentConversationsView {
+             AgentConversationsAction::OpenContextMenu { index, position } => {
+                 self.open_context_menu(*index, *position, ctx)
+             }
++            AgentConversationsAction::Trash(index) => self.trash(*index, ctx),
+             AgentConversationsAction::MoveToHost(terminal_view_id) => {
+                 self.context_menu_position = None;
+                 ctx.emit(AgentConversationsEvent::MoveToHost(*terminal_view_id));

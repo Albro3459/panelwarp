@@ -270,6 +270,7 @@ class WarpViewProvider {
         break;
       case 'warp-agents-list':
       case 'warp-agents-summary':
+      case 'warp-agents-trash':
       case 'warp-agents-open': {
         const reply = (fields) => this.post({ type: 'warp-agents-result', id: msg.id, ...fields });
         try {
@@ -281,6 +282,9 @@ class WarpViewProvider {
             await this.agents.summarize(agent, sessionId, (text) =>
               this.post({ type: 'warp-agents-text', id: msg.id, text }),
             );
+            reply({});
+          } else if (msg.type === 'warp-agents-trash') {
+            await this.agents.trash(agent, sessionId);
             reply({});
           } else {
             reply({ value: await this.agents.open(agent, sessionId, String(msg.mode || 'default')) });
@@ -497,6 +501,7 @@ function webviewHtml(server, keys) {
       'warp-agents-seen',
       'warp-agents-summary',
       'warp-agents-open',
+      'warp-agents-trash',
       'warp-routed-key',
       'warp-open-url',
       'warp-clipboard-write',

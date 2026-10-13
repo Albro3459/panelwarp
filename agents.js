@@ -263,6 +263,19 @@ const gemini = {
 
 const AGENTS = { claude, codex, gemini };
 
+/** This window's Claude Code editor tabs whose title matches a conversation's (tabs only show it). */
+function claudeTabsTitled(conversationTitle) {
+  const title = normalizeTitle(conversationTitle);
+  if (!title) return [];
+  return vscode.window.tabGroups.all
+    .flatMap((group) => group.tabs)
+    .filter((tab) => tab.input instanceof vscode.TabInputWebview && /claudeVSCodePanel$/.test(tab.input.viewType))
+    .filter((tab) => {
+      const label = normalizeTitle(tab.label);
+      return label && (title.startsWith(label) || label.startsWith(title));
+    });
+}
+
 class AgentConversations {
   /**
    * @param {import('./ai').WarpAi} ai for the OpenRouter key
@@ -494,14 +507,7 @@ class AgentConversations {
 
     if (mode === 'terminal') {
       // A move: its Claude Code tab here closes, so two never write to it at once.
-      const title = normalizeTitle(parsed?.title);
-      const tabs = vscode.window.tabGroups.all
-        .flatMap((group) => group.tabs)
-        .filter((tab) => tab.input instanceof vscode.TabInputWebview && /claudeVSCodePanel$/.test(tab.input.viewType))
-        .filter((tab) => {
-          const label = normalizeTitle(tab.label);
-          return title && label && (title.startsWith(label) || label.startsWith(title));
-        });
+      const tabs = claudeTabsTitled(parsed?.title);
       if (tabs.length) await vscode.window.tabGroups.close(tabs);
       return `${cd}claude --resume ${shellQuote(id)}`;
     }
@@ -522,6 +528,28 @@ class AgentConversations {
       forceNewWindow: folders.length > 0,
     });
     return undefined;
+  }
+
+  /**
+   * Moves a conversation's session file to the Trash (so it can be put back), with Claude Code's
+   * folder of its subagent transcripts and tool results next to it. Its Claude Code tab here
+   * closes first, or the extension would write the file again.
+   */
+  async trash(agent, id) {
+    const entry = this.entry(agent, id);
+    const parsed = this.parsed.get(`${entry.file}\0${entry.mtimeMs}`) || AGENTS[agent].parse(entry, new Map());
+    const paths = [entry.file];
+    if (agent === 'claude') {
+      const tabs = claudeTabsTitled(parsed?.title);
+      if (tabs.length) await vscode.window.tabGroups.close(tabs);
+      const sideFolder = path.join(path.dirname(entry.file), id);
+      if (fs.existsSync(sideFolder)) paths.push(sideFolder);
+    }
+    for (const file of paths) {
+      await vscode.workspace.fs.delete(vscode.Uri.file(file), { recursive: true, useTrash: true });
+    }
+    this.known.delete(`${agent}:${id}`);
+    this.log.appendLine(`agents: moved ${agent} conversation ${id} to the Trash`);
   }
 
   /**
