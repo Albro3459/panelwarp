@@ -1,0 +1,28 @@
+From f72cb303a04f37aee743db62295fe7b652c10721 Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Tue, 13 Oct 2026 20:19:49 -0700
+Subject: [PATCH 61/61] New tabs start in the VS Code window's folder in
+ embedded builds
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/workspace/view/startup_directory.rs | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/workspace/view/startup_directory.rs b/app/src/workspace/view/startup_directory.rs
+index b6db5a3..97aa02c 100644
+--- a/app/src/workspace/view/startup_directory.rs
++++ b/app/src/workspace/view/startup_directory.rs
+@@ -91,7 +91,11 @@ impl Workspace {
+             }
+         }
+ 
+-        let is_same_system = same_system(prev_session_shell.as_ref(), chosen_shell, ctx);
++        // Embedded in a VS Code window, a new tab starts in that window's folder (the host's
++        // default directory) rather than the active tab's, which may be a tab restored from
++        // another window.
++        let is_same_system = !cfg!(feature = "remote_tty")
++            && same_system(prev_session_shell.as_ref(), chosen_shell, ctx);
+ 
+         compute_startup_directory_from_prev_session(
+             new_session_source,
