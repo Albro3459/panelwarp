@@ -6,6 +6,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const { startServer } = require('./server');
 
 const IDLE_EXIT_MS = 5 * 60 * 1000;
@@ -65,6 +66,10 @@ async function main() {
 
   let idleSince = Date.now();
   setInterval(() => {
+    if (!loginSessionAlive()) {
+      log('login session ended (user lookups fail); exiting');
+      shutdown(server);
+    }
     const { sessions, lastActivity } = server.stats();
     if (sessions) idleSince = Date.now();
     if (Date.now() - Math.max(idleSince, lastActivity) < IDLE_EXIT_MS) return;
@@ -72,6 +77,20 @@ async function main() {
     shutdown(server);
   }, IDLE_CHECK_MS);
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => shutdown(server));
+}
+
+// On macOS, this detached host can outlive the user's logout. Its shells then can't reach the old
+// login session's directory services: `id -un` prints the uid, and tools that look up the user or
+// its groups fail (Homebrew: "Could not determine home directory", "malloc: possible integer
+// overflow"). getpwuid failing is the sign; ending the host makes pages start fresh shells in a
+// host from the new session.
+function loginSessionAlive() {
+  try {
+    os.userInfo();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function shutdown(server) {
