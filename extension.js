@@ -282,6 +282,7 @@ class WarpViewProvider {
     switch (msg?.type) {
       case 'warp-loaded':
         this.warpLoaded = true;
+        this.liveSettings = msg.liveSettings === true;
         if (msg.timing) this.log.appendLine(`page loaded (ms since page start): ${JSON.stringify(msg.timing)}`);
         if (this.pendingUrl) {
           this.post({ type: 'warp-navigate', url: this.pendingUrl });
@@ -447,6 +448,17 @@ class WarpViewProvider {
 
   post(msg) {
     this.view?.webview.postMessage(msg);
+  }
+
+  /**
+   * Hands the running Warp entries changed in the settings files. Returns false if this Warp build
+   * can't apply them without a reload.
+   */
+  applyStorageChanges(changes) {
+    if ('HostHistorySync' in changes) this.syncHistory();
+    if (!this.view || !this.warpLoaded || !this.liveSettings) return false;
+    if (Object.keys(changes).length) this.post({ type: 'warp-storage-update', changes });
+    return true;
   }
 
   /** The tabs to restore (sessionStore.js), as JSON; null if none or unreadable. */
@@ -638,6 +650,7 @@ function activate(context) {
   );
   provider.settingsFile = new SettingsFile(context, {
     storageKey: STORAGE_KEY,
+    onChanged: (changes) => provider.applyStorageChanges(changes),
     onApplied: () => provider.restart(),
     log,
   });

@@ -62,7 +62,16 @@
         const check = () => {
           if (document.querySelector('canvas')) {
             requestAnimationFrame(() => setTimeout(() => this.root.classList.add('done'), 250));
-            if (embedded) window.parent.postMessage({ type: 'warp-loaded', timing: loadTiming() }, '*');
+            if (embedded) {
+              window.parent.postMessage(
+                {
+                  type: 'warp-loaded',
+                  timing: loadTiming(),
+                  liveSettings: typeof window.warpPanelReloadSettings === 'function',
+                },
+                '*',
+              );
+            }
           } else {
             setTimeout(check, 100);
           }
@@ -527,6 +536,16 @@
         }
         clear.call(this);
       };
+      // Entries changed in the extension's settings files: written without reporting them back,
+      // then our Warp build re-reads them (app/src/platform/wasm.rs, host_settings).
+      window.addEventListener('message', (e) => {
+        if (e.source !== window.parent || e.data?.type !== 'warp-storage-update') return;
+        for (const [key, value] of Object.entries(e.data.changes || {})) {
+          if (value === null) removeItem.call(window.localStorage, key);
+          else setItem.call(window.localStorage, key, String(value));
+        }
+        window.warpPanelReloadSettings?.();
+      });
     }
 
     let started = false;

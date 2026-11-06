@@ -26,13 +26,13 @@ const KEYBINDINGS_HEADER = `# Warp panel keybindings (same format as desktop War
 # Each line maps an action to its keys, or to none to unbind it, e.g.
 # "editor_view:insert_autosuggestion": tab
 # "workspace:toggle_command_palette": none
-# Edits apply after the Warp panel reloads (it offers to when you save this file in VS Code).
+# Saved edits apply to the running panel (Warp builds without live reload offer to reload it).
 # Warp rewrites this file without comments when you change a keybinding in its settings.
 `;
 
 const HEADER = `# Warp panel settings (same format as desktop Warp's ~/.warp/settings.toml).
 # Warp reads this file when the panel starts and writes your changes from its settings page here.
-# Edits apply after the Warp panel reloads (it offers to when you save this file in VS Code).
+# Saved edits apply to the running panel (Warp builds without live reload offer to reload it).
 # Only settings you've changed are listed, plus the panel's own settings under [host].
 # Removing a setting resets it to its default. Comments other than this header are dropped when
 # Warp writes a change.
@@ -154,24 +154,51 @@ function read(file) {
 const isPrivateRouting = (entries) =>
   entries.HostAiPrivateRouting === undefined || decode(entries.HostAiPrivateRouting) !== false;
 
+/** Entries that differ between two sets, as changes (null for removed). */
+function changedEntries(previous, next) {
+  const changes = {};
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(next)])) {
+    if (!(key in next)) changes[key] = null;
+    else if (previous[key] !== next[key]) changes[key] = next[key];
+  }
+  return changes;
+}
+
 class SettingsFile {
   /**
    * @param {vscode.ExtensionContext} context
-   * @param {{storageKey: string, onApplied: () => Promise<void>, log: vscode.OutputChannel}} options
+   * @param {{storageKey: string, onChanged: (changes: object) => boolean,
+   *   onApplied: () => Promise<void>, log: vscode.OutputChannel}} options `onChanged` hands a
+   *   running Warp the changed entries, and returns false if it can't apply them without a reload
    */
-  constructor(context, { storageKey, onApplied, log }) {
+  constructor(context, { storageKey, onChanged, onApplied, log }) {
     this.globalState = context.globalState;
     this.storageKey = storageKey;
+    this.onChanged = onChanged;
     this.onApplied = onApplied;
     this.log = log;
-    this.file = path.join(context.globalStorageUri.fsPath, 'settings.toml');
-    this.keybindingsFile = path.join(context.globalStorageUri.fsPath, 'keybindings.yaml');
+    const dir = context.globalStorageUri.fsPath;
+    this.file = path.join(dir, 'settings.toml');
+    this.keybindingsFile = path.join(dir, 'keybindings.yaml');
     context.subscriptions.push(
       vscode.workspace.onDidSaveTextDocument((doc) => {
-        if (doc.uri.fsPath === this.file) this.applySaved(doc.getText());
-        else if (doc.uri.fsPath === this.keybindingsFile) this.promptReload('Warp keybindings saved.');
+        if (doc.uri.fsPath === this.file || doc.uri.fsPath === this.keybindingsFile) this.applySaved();
       }),
     );
+    // Edits from any editor, and changes saved by other windows' Warp
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      let timer;
+      const watcher = fs.watch(dir, (_event, name) => {
+        if (name && name !== 'settings.toml' && name !== 'keybindings.yaml') return;
+        clearTimeout(timer);
+        timer = setTimeout(() => this.applyWatched(), 100);
+      });
+      watcher.on('error', (error) => log.appendLine(`settings file watcher: ${error.message}`));
+      context.subscriptions.push({ dispose: () => watcher.close() });
+    } catch (error) {
+      log.appendLine(`can't watch the settings files: ${error.message}`);
+    }
   }
 
   /**
@@ -191,25 +218,39 @@ class SettingsFile {
   }
 
   /**
-   * The localStorage entries for the page: the mirror with its settings and keybindings taken from
-   * the files, which also updates the mirror. If a file can't be read, the mirror's values are used.
+   * Reads both files into the mirror; returns the changed entries (null for removed). Turning
+   * private routing off asks first when `confirm` is set; otherwise routing stays on until a sync
+   * that confirms. Throws if a file can't be read or parsed.
    */
-  async entries() {
+  async sync(confirm) {
     const previous = this.globalState.get(this.storageKey, {});
     // Until migrate() succeeds the file may be stale
-    if (!this.globalState.get(IN_FILE_KEY)) return previous;
-    let text;
-    let next;
+    if (!this.globalState.get(IN_FILE_KEY)) return {};
+    const text = read(this.file);
+    let next = withKeybindings(applyToml(text, previous), read(this.keybindingsFile));
+    if (isPrivateRouting(previous) && !isPrivateRouting(next) && !(confirm && (await confirmPublicRouting()))) {
+      next = { ...next, HostAiPrivateRouting: encode(true) };
+      if (confirm) {
+        fs.writeFileSync(this.file, updateToml(text, { HostAiPrivateRouting: encode(true) }));
+        vscode.window.showInformationMessage('Warp: private routing stays on.');
+      }
+    }
+    const changes = changedEntries(previous, next);
+    if (Object.keys(changes).length) await this.globalState.update(this.storageKey, next);
+    return changes;
+  }
+
+  /**
+   * The localStorage entries for the page: the mirror with its settings and keybindings taken from
+   * the files. If a file can't be read, the mirror's values are used.
+   */
+  async entries() {
     try {
-      text = read(this.file);
-      next = withKeybindings(applyToml(text, previous), read(this.keybindingsFile));
+      await this.sync(true);
     } catch (error) {
       vscode.window.showErrorMessage(`Warp couldn't read its settings: ${error.message}`);
-      return previous;
     }
-    next = await this.guardPrivateRouting(previous, next, text);
-    await this.globalState.update(this.storageKey, next);
-    return next;
+    return this.globalState.get(this.storageKey, {});
   }
 
   /** Saves changed localStorage entries (null for removed) from the page. */
@@ -252,39 +293,33 @@ class SettingsFile {
     await vscode.window.showTextDocument(doc, { preview: false });
   }
 
-  async applySaved(text) {
-    const previous = this.globalState.get(this.storageKey, {});
-    let next;
+  /** A settings or keybindings file saved in a VS Code editor; the watcher may have synced it first. */
+  async applySaved() {
+    let changes;
     try {
-      next = applyToml(text, previous);
-    } catch (e) {
-      vscode.window.showErrorMessage(`Warp settings.toml has a syntax error: ${e.message}`);
+      changes = await this.sync(true);
+    } catch (error) {
+      vscode.window.showErrorMessage(`Warp couldn't apply the file: ${error.message}`);
       return;
     }
-    next = await this.guardPrivateRouting(previous, next, text);
-    await this.globalState.update(this.storageKey, next);
-    this.log.appendLine('applied settings.toml');
-    await this.promptReload('Warp settings saved.');
-  }
-
-  async promptReload(message) {
+    this.log.appendLine('applied a saved settings file');
+    if (this.onChanged(changes)) return;
     const choice = await vscode.window.showInformationMessage(
-      `${message} Reload the Warp panel to apply them? This restarts its shell sessions.`,
+      'Warp settings saved. Reload the Warp panel to apply them? This restarts its shell sessions.',
       'Reload now',
       'Later',
     );
     if (choice === 'Reload now') await this.onApplied();
   }
 
-  /**
-   * Asks before settings.toml turns private routing off. If the user declines, routing stays on and
-   * the file says so; returns the entries to use.
-   */
-  async guardPrivateRouting(previous, next, text) {
-    if (!isPrivateRouting(previous) || isPrivateRouting(next) || (await confirmPublicRouting())) return next;
-    fs.writeFileSync(this.file, updateToml(text, { HostAiPrivateRouting: encode(true) }));
-    vscode.window.showInformationMessage('Warp: private routing stays on.');
-    return { ...next, HostAiPrivateRouting: encode(true) };
+  async applyWatched() {
+    try {
+      const changes = await this.sync(false);
+      if (Object.keys(changes).length) this.onChanged(changes);
+    } catch (error) {
+      // E.g. a syntax error in an edit in progress; saving it in VS Code shows the error
+      this.log.appendLine(`settings files: ${error.message}`);
+    }
   }
 }
 
