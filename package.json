@@ -124,6 +124,11 @@
         "category": "Warp"
       },
       {
+        "command": "warp.openSettingsFile",
+        "title": "Open Settings File",
+        "category": "Warp"
+      },
+      {
         "command": "warp.setOpenRouterApiKey",
         "title": "Set OpenRouter API Key",
         "category": "Warp"

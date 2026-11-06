@@ -1,6 +1,7 @@
 # Development-only files; scripts/package.sh adds per-platform excludes.
 .vscode/**
 scripts/**
+TODO/**
 ROADMAP.md
 CLAUDE.md
 **/*.map
