@@ -215,12 +215,13 @@ class SettingsFile {
         if (doc.uri.fsPath === this.file || doc.uri.fsPath === this.keybindingsFile) this.applySaved();
       }),
     );
-    // Edits from any editor, and changes saved by other windows' Warp
+    // Edits from any editor, and changes saved by other windows' Warp (the routing marker included)
+    const watched = [this.file, this.keybindingsFile, this.routingAllowedFile].map((file) => path.basename(file));
     try {
       fs.mkdirSync(dir, { recursive: true });
       let timer;
       const watcher = fs.watch(dir, (_event, name) => {
-        if (name && name !== 'settings.toml' && name !== 'keybindings.yaml') return;
+        if (name && !watched.includes(name)) return;
         clearTimeout(timer);
         timer = setTimeout(() => this.apply(false), 100);
       });
@@ -246,12 +247,14 @@ class SettingsFile {
     if (fs.existsSync(this.migratedFile)) return;
     const mirror = this.globalState.get(this.storageKey, {});
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    const text = renderToml(mirror);
-    const existing = read(this.file);
-    if (existing && existing !== text) fs.copyFileSync(this.file, `${this.file}.bak`);
-    fs.writeFileSync(this.file, text);
+    const replace = (file, text) => {
+      const existing = read(file);
+      if (existing && existing !== text) fs.copyFileSync(file, `${file}.bak`);
+      fs.writeFileSync(file, text);
+    };
+    replace(this.file, renderToml(mirror));
     if (typeof mirror[KEYBINDINGS_KEY] === 'string') {
-      fs.writeFileSync(this.keybindingsFile, JSON.parse(mirror[KEYBINDINGS_KEY]));
+      replace(this.keybindingsFile, JSON.parse(mirror[KEYBINDINGS_KEY]));
     }
     // Routing off in the mirror was confirmed when it was turned off
     this.setRoutingOffAllowed(!isPrivateRouting(mirror));
@@ -338,25 +341,28 @@ class SettingsFile {
       else next[key] = value;
     }
     this.state = next;
-    await this.updateMirror(changes);
-    if (!fs.existsSync(this.migratedFile)) return;
-    try {
-      // Warp's settings page asks before it turns private routing off. Recorded before the file
-      // is written, so other windows find it when they read the file.
-      if ('HostAiPrivateRouting' in changes) this.setRoutingOffAllowed(!isPrivateRouting(next));
-      // Keybindings first, so a syntax error in settings.toml can't hold them back
-      if (typeof changes[KEYBINDINGS_KEY] === 'string') {
-        fs.writeFileSync(this.keybindingsFile, JSON.parse(changes[KEYBINDINGS_KEY]));
+    // The files before the mirror's await, so a watcher sync in between can't read the old file
+    // against the new entries
+    if (fs.existsSync(this.migratedFile)) {
+      try {
+        // Keybindings first, so a syntax error in settings.toml can't hold them back
+        if (typeof changes[KEYBINDINGS_KEY] === 'string') {
+          fs.writeFileSync(this.keybindingsFile, JSON.parse(changes[KEYBINDINGS_KEY]));
+        }
+        if (Object.keys(changes).some((key) => key in SETTINGS_MAP)) {
+          fs.writeFileSync(this.file, updateToml(read(this.file), changes));
+        }
+        // Warp's settings page asks before it turns private routing off. Recorded after the file,
+        // so another window that read the old file can't remove it; the watcher picks it up.
+        if ('HostAiPrivateRouting' in changes) this.setRoutingOffAllowed(!isPrivateRouting(next));
+      } catch (error) {
+        // E.g. a syntax error from an edit in progress. The file still wins the next time it's read.
+        vscode.window.showErrorMessage(
+          `Warp couldn't save your change, so it lasts until the settings file is read again: ${error.message}`,
+        );
       }
-      if (Object.keys(changes).some((key) => key in SETTINGS_MAP)) {
-        fs.writeFileSync(this.file, updateToml(read(this.file), changes));
-      }
-    } catch (error) {
-      // E.g. a syntax error from an edit in progress. The file still wins the next time it's read.
-      vscode.window.showErrorMessage(
-        `Warp couldn't save your change, so it lasts until the settings file is read again: ${error.message}`,
-      );
     }
+    await this.updateMirror(changes);
   }
 
   open() {
