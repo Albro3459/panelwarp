@@ -129,6 +129,11 @@
         "category": "Warp"
       },
       {
+        "command": "warp.openKeybindingsFile",
+        "title": "Open Keybindings File",
+        "category": "Warp"
+      },
+      {
         "command": "warp.setOpenRouterApiKey",
         "title": "Set OpenRouter API Key",
         "category": "Warp"

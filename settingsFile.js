@@ -1,8 +1,9 @@
-// Warp's settings for the panel live in settings.toml in the extension's storage folder, in the same
-// shape as desktop Warp's ~/.warp/settings.toml. Web Warp reads and writes settings as localStorage
-// entries, so the page gets them from the file at startup and every change it makes is written back.
-// globalState keeps a mirror of all entries (panelSettings.js reads the panel's own settings from
-// it, and entries that aren't settings only live there), kept equal to the file.
+// Warp's settings and keybindings for the panel live in settings.toml and keybindings.yaml in the
+// extension's storage folder, in the same shape as desktop Warp's ~/.warp files. Web Warp reads and
+// writes them as localStorage entries, so the page gets them from the files at startup and every
+// change it makes is written back. globalState keeps a mirror of all entries (panelSettings.js
+// reads the panel's own settings from it, and entries that aren't settings only live there), kept
+// equal to the files.
 
 const vscode = require('vscode');
 const fs = require('fs');
@@ -16,6 +17,18 @@ const SETTINGS_MAP = require('./media/settings-map.json');
 
 // Set once settings.toml replaced the globalState mirror as where settings are kept
 const IN_FILE_KEY = 'warp.settingsInFile';
+
+// localStorage key our Warp build keeps keybindings.yaml's text under (app/src/keyboard.rs), as a
+// JSON string
+const KEYBINDINGS_KEY = 'CustomKeybindings';
+
+const KEYBINDINGS_HEADER = `# Warp panel keybindings (same format as desktop Warp's ~/.warp/keybindings.yaml).
+# Each line maps an action to its keys, or to none to unbind it, e.g.
+# "editor_view:insert_autosuggestion": tab
+# "workspace:toggle_command_palette": none
+# Edits apply after the Warp panel reloads (it offers to when you save this file in VS Code).
+# Warp rewrites this file without comments when you change a keybinding in its settings.
+`;
 
 const HEADER = `# Warp panel settings (same format as desktop Warp's ~/.warp/settings.toml).
 # Warp reads this file when the panel starts and writes your changes from its settings page here.
@@ -120,6 +133,24 @@ function updateToml(text, changes) {
   return HEADER + '\n' + TOML.stringify(doc);
 }
 
+/** Puts keybindings.yaml text into the entries; an empty file means no custom keybindings. */
+function withKeybindings(entries, text) {
+  const next = { ...entries };
+  if (text.trim()) next[KEYBINDINGS_KEY] = JSON.stringify(text);
+  else delete next[KEYBINDINGS_KEY];
+  return next;
+}
+
+/** A file's text; empty when it doesn't exist, which means every setting or keybinding is default. */
+function read(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
 const isPrivateRouting = (entries) =>
   entries.HostAiPrivateRouting === undefined || decode(entries.HostAiPrivateRouting) !== false;
 
@@ -134,9 +165,11 @@ class SettingsFile {
     this.onApplied = onApplied;
     this.log = log;
     this.file = path.join(context.globalStorageUri.fsPath, 'settings.toml');
+    this.keybindingsFile = path.join(context.globalStorageUri.fsPath, 'keybindings.yaml');
     context.subscriptions.push(
       vscode.workspace.onDidSaveTextDocument((doc) => {
         if (doc.uri.fsPath === this.file) this.applySaved(doc.getText());
+        else if (doc.uri.fsPath === this.keybindingsFile) this.promptReload('Warp keybindings saved.');
       }),
     );
   }
@@ -150,26 +183,16 @@ class SettingsFile {
     if (this.globalState.get(IN_FILE_KEY)) return;
     const text = renderToml(this.globalState.get(this.storageKey, {}));
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    const existing = this.read();
+    const existing = read(this.file);
     if (existing && existing !== text) fs.copyFileSync(this.file, `${this.file}.bak`);
     fs.writeFileSync(this.file, text);
     await this.globalState.update(IN_FILE_KEY, true);
     this.log.appendLine('moved settings into settings.toml');
   }
 
-  /** settings.toml's text; empty when it doesn't exist, which means every setting is default. */
-  read() {
-    try {
-      return fs.readFileSync(this.file, 'utf8');
-    } catch (error) {
-      if (error.code === 'ENOENT') return '';
-      throw error;
-    }
-  }
-
   /**
-   * The localStorage entries for the page: the mirror with its settings taken from settings.toml,
-   * which also updates the mirror. If the file can't be read, the mirror's settings are used.
+   * The localStorage entries for the page: the mirror with its settings and keybindings taken from
+   * the files, which also updates the mirror. If a file can't be read, the mirror's values are used.
    */
   async entries() {
     const previous = this.globalState.get(this.storageKey, {});
@@ -178,10 +201,10 @@ class SettingsFile {
     let text;
     let next;
     try {
-      text = this.read();
-      next = applyToml(text, previous);
+      text = read(this.file);
+      next = withKeybindings(applyToml(text, previous), read(this.keybindingsFile));
     } catch (error) {
-      vscode.window.showErrorMessage(`Warp couldn't read settings.toml: ${error.message}`);
+      vscode.window.showErrorMessage(`Warp couldn't read its settings: ${error.message}`);
       return previous;
     }
     next = await this.guardPrivateRouting(previous, next, text);
@@ -198,22 +221,34 @@ class SettingsFile {
     }
     await this.globalState.update(this.storageKey, entries);
     if (!this.globalState.get(IN_FILE_KEY)) return;
-    if (!Object.keys(changes).some((key) => key in SETTINGS_MAP)) return;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, updateToml(this.read(), changes));
+      if (Object.keys(changes).some((key) => key in SETTINGS_MAP)) {
+        fs.writeFileSync(this.file, updateToml(read(this.file), changes));
+      }
+      if (typeof changes[KEYBINDINGS_KEY] === 'string') {
+        fs.writeFileSync(this.keybindingsFile, JSON.parse(changes[KEYBINDINGS_KEY]));
+      }
     } catch (error) {
       // E.g. a syntax error from an edit in progress; the mirror keeps the change for this session
-      vscode.window.showErrorMessage(`Warp couldn't save your change to settings.toml: ${error.message}`);
+      vscode.window.showErrorMessage(`Warp couldn't save your change: ${error.message}`);
     }
   }
 
-  async open() {
-    if (!fs.existsSync(this.file)) {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, renderToml(this.globalState.get(this.storageKey, {})));
+  open() {
+    return this.show(this.file, () => renderToml(this.globalState.get(this.storageKey, {})));
+  }
+
+  openKeybindings() {
+    return this.show(this.keybindingsFile, () => KEYBINDINGS_HEADER);
+  }
+
+  async show(file, initialText) {
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, initialText());
     }
-    const doc = await vscode.workspace.openTextDocument(this.file);
+    const doc = await vscode.workspace.openTextDocument(file);
     await vscode.window.showTextDocument(doc, { preview: false });
   }
 
@@ -229,8 +264,12 @@ class SettingsFile {
     next = await this.guardPrivateRouting(previous, next, text);
     await this.globalState.update(this.storageKey, next);
     this.log.appendLine('applied settings.toml');
+    await this.promptReload('Warp settings saved.');
+  }
+
+  async promptReload(message) {
     const choice = await vscode.window.showInformationMessage(
-      'Warp settings saved. Reload the Warp panel to apply them? This restarts its shell sessions.',
+      `${message} Reload the Warp panel to apply them? This restarts its shell sessions.`,
       'Reload now',
       'Later',
     );

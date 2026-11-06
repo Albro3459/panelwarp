@@ -707,6 +707,7 @@ function activate(context) {
     }),
     vscode.commands.registerCommand('warp.restart', () => provider.restart()),
     vscode.commands.registerCommand('warp.openSettingsFile', () => provider.settingsFile.open()),
+    vscode.commands.registerCommand('warp.openKeybindingsFile', () => provider.settingsFile.openKeybindings()),
     vscode.commands.registerCommand('warp.benchmarkCommandSearch', () => provider.ai.benchmark()),
     vscode.commands.registerCommand('warp.setOpenRouterApiKey', () =>
       provider.openWarpUrl('warposs://settings?widget=host_api_key'),
