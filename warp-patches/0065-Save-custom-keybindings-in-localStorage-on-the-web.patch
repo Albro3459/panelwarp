@@ -13,7 +13,8 @@ desktop's keybindings.yaml, in localStorage under CustomKeybindings.
 Embedded hosts persist it with the rest of localStorage; the VS Code
 panel writes it to a keybindings.yaml.
 
-Not compiled yet: written without a Rust toolchain.
+Built for wasm (wasm-fast) and tested in a browser: the Tab key behavior
+choice is stored and still applies after a page reload.
 ---
  app/src/keyboard.rs | 43 ++++++++++++++++++++++++++++++++++++-------
  1 file changed, 36 insertions(+), 7 deletions(-)

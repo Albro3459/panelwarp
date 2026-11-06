@@ -16,7 +16,8 @@ and emits KeybindingChangedEvent so views showing keys update. The
 Features page's Tab key behavior dropdown still shows the old value
 until the page is opened again.
 
-Not compiled yet: written without a Rust toolchain.
+Built for wasm (wasm-fast) and tested in a browser: changed keybindings
+and font size applied after warpPanelReloadSettings() without a reload.
 ---
  app/src/keyboard.rs      | 40 +++++++++++++++++++++++++++++
  app/src/lib.rs           |  2 ++
