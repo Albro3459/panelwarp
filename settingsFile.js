@@ -345,6 +345,12 @@ class SettingsFile {
     // against the new entries
     if (fs.existsSync(this.migratedFile)) {
       try {
+        // Warp's settings page asks before it turns private routing off. Allowing it is recorded
+        // after the file, so another window that read the old file can't remove it (the watcher
+        // picks it up). Turning routing on is recorded first, so a failed write can't leave off
+        // allowed.
+        const routingOn = 'HostAiPrivateRouting' in changes ? isPrivateRouting(next) : null;
+        if (routingOn === true) this.setRoutingOffAllowed(false);
         // Keybindings first, so a syntax error in settings.toml can't hold them back
         if (typeof changes[KEYBINDINGS_KEY] === 'string') {
           fs.writeFileSync(this.keybindingsFile, JSON.parse(changes[KEYBINDINGS_KEY]));
@@ -352,9 +358,7 @@ class SettingsFile {
         if (Object.keys(changes).some((key) => key in SETTINGS_MAP)) {
           fs.writeFileSync(this.file, updateToml(read(this.file), changes));
         }
-        // Warp's settings page asks before it turns private routing off. Recorded after the file,
-        // so another window that read the old file can't remove it; the watcher picks it up.
-        if ('HostAiPrivateRouting' in changes) this.setRoutingOffAllowed(!isPrivateRouting(next));
+        if (routingOn === false) this.setRoutingOffAllowed(true);
       } catch (error) {
         // E.g. a syntax error from an edit in progress. The file still wins the next time it's read.
         vscode.window.showErrorMessage(
