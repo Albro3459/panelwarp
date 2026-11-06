@@ -37,8 +37,9 @@ const HEADER = `# Warp panel settings (same format as desktop Warp's ~/.warp/set
 # Removing a setting resets it to its default. Comments other than this header are dropped when
 # Warp writes a change.
 #
-# host.history_sync = true syncs your newest 500 commands to your other machines through VS Code
-# Settings Sync (commands starting with a space are left out).
+# This file stays on this machine: VS Code Settings Sync only carries command history, and only with
+# host.history_sync = true, which syncs your newest 500 commands to your other machines (commands
+# starting with a space are left out).
 # [host.ai]: models are OpenRouter model ids; expanded_model = "" means fast suggestions only;
 # expanded_effort is minimal, low, medium or high; recent_commands_in_context only applies while
 # private_routing is on. After a failed command the fast model suggests a fix; next_command = true

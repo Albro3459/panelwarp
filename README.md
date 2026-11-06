@@ -14,7 +14,9 @@ local PTY server, so you get Warp's terminal without leaving VS Code:
 - **AI command search (`#`) and Next Command** with your own OpenRouter key (bring your own key,
   stored in VS Code's secret storage; zero-data-retention routing on by default).
 - **Warp's settings, themes and appearance**, saved in a `settings.toml` like desktop Warp's
-  (**Warp: Open Settings File**).
+  (**Warp: Open Settings File**), and **keybindings** in a `keybindings.yaml` (**Warp: Open
+  Keybindings File**). Both stay on this machine; VS Code Settings Sync only carries command history,
+  if you turn on `host.history_sync`.
 
 Warp's account, cloud and Agent Mode features are hidden: no Warp account or sign-in is needed.
 
