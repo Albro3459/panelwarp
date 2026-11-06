@@ -170,7 +170,7 @@
     // Keys listed in ?keys= (VS Code-style specs, e.g. "cmd+shift+p") are routed to the
     // embedding VS Code webview instead of Warp, like terminal.integrated.commandsToSkipShell.
     const params = new URLSearchParams(location.search);
-    const routedKeys = JSON.parse(params.get('keys') || '[]').map(parseSpec);
+    let routedKeys = JSON.parse(params.get('keys') || '[]').map(parseSpec);
     const embedded = window.parent !== window;
 
     function parseSpec(spec) {
@@ -472,6 +472,8 @@
           );
         } else if (msg.type === 'warp-focus') {
           canvas?.focus();
+        } else if (msg.type === 'warp-routed-keys') {
+          routedKeys = msg.keys.map(parseSpec);
         } else if (msg.type === 'warp-send-key' && canvas) {
           canvas.focus();
           // Warp tracks modifiers from their own key events, so press them around the key. Each

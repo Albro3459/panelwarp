@@ -209,7 +209,7 @@ class WarpViewProvider {
     this.storageDir = storageDir;
     this.settingsFile = null;
     this.ready = Promise.resolve();
-    this.panelSettings = new PanelSettings(globalState, STORAGE_KEY);
+    this.panelSettings = new PanelSettings(globalState, STORAGE_KEY, () => this.settingsFile.state);
     this.history = null;
     this.ai = null;
     this.log = log;
@@ -283,6 +283,7 @@ class WarpViewProvider {
       case 'warp-loaded':
         this.warpLoaded = true;
         this.liveSettings = msg.liveSettings === true;
+        this.settingsFile.confirmRouting();
         if (msg.timing) this.log.appendLine(`page loaded (ms since page start): ${JSON.stringify(msg.timing)}`);
         if (this.pendingUrl) {
           this.post({ type: 'warp-navigate', url: this.pendingUrl });
@@ -295,7 +296,7 @@ class WarpViewProvider {
       case 'warp-storage-request':
         this.post({
           type: 'warp-storage-snapshot',
-          entries: await this.settingsFile.entries(),
+          entries: await this.settingsFile.load(),
           history: this.history ? JSON.stringify(this.history.load()) : null,
           session: this.loadSession(),
           workflows: JSON.stringify(
@@ -305,7 +306,7 @@ class WarpViewProvider {
         break;
       case 'warp-storage-changes':
         await this.settingsFile.save(msg.changes || {});
-        if ('HostHistorySync' in (msg.changes || {})) await this.syncHistory();
+        this.onSettingsChanged(msg.changes || {});
         break;
       case 'warp-ai-generate-commands':
         try {
@@ -374,7 +375,7 @@ class WarpViewProvider {
         await this.ai.storeApiKey(String(msg.provider), String(msg.key));
         break;
       case 'warp-open-settings':
-        await this.settingsFile?.open();
+        await this.settingsFile.open();
         break;
       case 'warp-resolve-paths': {
         let value = [];
@@ -455,10 +456,19 @@ class WarpViewProvider {
    * can't apply them without a reload.
    */
   applyStorageChanges(changes) {
-    if ('HostHistorySync' in changes) this.syncHistory();
+    this.onSettingsChanged(changes);
     if (!this.view || !this.warpLoaded || !this.liveSettings) return false;
     if (Object.keys(changes).length) this.post({ type: 'warp-storage-update', changes });
     return true;
+  }
+
+  /** Acts on the panel's own settings that changed, in Warp or in the files. */
+  onSettingsChanged(changes) {
+    if ('HostHistorySync' in changes) this.syncHistory();
+    // The page only reads ?keys= when it loads
+    if ('HostKeysToHost' in changes) {
+      this.post({ type: 'warp-routed-keys', keys: Object.keys(this.panelSettings.keysToVSCode()) });
+    }
   }
 
   /** The tabs to restore (sessionStore.js), as JSON; null if none or unreadable. */
@@ -614,8 +624,7 @@ function escapeHtml(s) {
 function activate(context) {
   const log = vscode.window.createOutputChannel('Warp Terminal for VS Code');
   // Only opt-in history sync goes through VS Code Settings Sync. Settings stay per machine in
-  // settings.toml like desktop Warp's, so the mirror isn't synced: another machine's synced
-  // entries would override this machine's file until the next reload.
+  // settings.toml like desktop Warp's, so the mirror isn't synced either.
   context.globalState.setKeysForSync([HISTORY_SYNC_KEY]);
   const provider = new WarpViewProvider(context.globalState, context.globalStorageUri.fsPath, log);
   provider.ai = new WarpAi(
@@ -659,7 +668,9 @@ function activate(context) {
     .migrateFromVSCodeSettings()
     .catch((error) => log.appendLine(`settings migration failed: ${error.message}`))
     .then(() => provider.settingsFile.migrate())
-    .catch((error) => log.appendLine(`moving settings into settings.toml failed: ${error.message}`));
+    .catch((error) => log.appendLine(`moving settings into settings.toml failed: ${error.message}`))
+    // Before history sync below reads host.history_sync
+    .then(() => provider.settingsFile.load());
   try {
     provider.history = new CommandHistory(context.globalStorageUri.fsPath);
     provider.history.shell = startupShell();

@@ -16,7 +16,8 @@ local PTY server, so you get Warp's terminal without leaving VS Code:
 - **Warp's settings, themes and appearance**, saved in a `settings.toml` like desktop Warp's
   (**Warp: Open Settings File**), and **keybindings** in a `keybindings.yaml` (**Warp: Open
   Keybindings File**). Both stay on this machine; VS Code Settings Sync only carries command history,
-  if you turn on `host.history_sync`.
+  if you turn on `host.history_sync`. A remote window (SSH, WSL, containers) keeps its own copy on
+  the remote machine, which starts from your settings at the time.
 
 Warp's account, cloud and Agent Mode features are hidden: no Warp account or sign-in is needed.
 
