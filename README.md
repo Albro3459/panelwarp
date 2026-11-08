@@ -23,10 +23,11 @@ Open the **Warp** tab in the bottom panel (View → Open View… → Warp). Warp
 actions that collide with VS Code shortcuts are in the Command Palette under "Warp: …". To
 use AI features, run **Warp: Set OpenRouter API Key**.
 
-Windows full of Claude Code conversations can be put away and brought back: **Save window**
-in the status bar (or the archive button on a Claude Code tab) saves the window's conversations
-and their layout to a list and closes the window; **N saved** in the status bar (or **Warp:
-Reopen a Saved Window**) reopens one with all its conversations.
+Windows full of Claude Code conversations can be put away and brought back: the archive
+button in the Warp panel's title bar (also in the status bar as **Save window**, and in the tab
+row of an active Claude Code tab) saves the window's conversations and their layout to a list
+and closes the window; the window button next to it (**N saved** in the status bar, or **Warp:
+Reopen a Saved Window** in the Command Palette) reopens one with all its conversations.
 
 Platform: macOS (Apple silicon and Intel).
 

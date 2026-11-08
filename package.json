@@ -2,7 +2,7 @@
   "name": "panelwarp",
   "displayName": "Warp Terminal for VS Code",
   "description": "An unofficial fork of the open-source Warp terminal, running in a VS Code panel tab next to Terminal: blocks, command search, completions and BYOK AI. Not affiliated with Warp.",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "publisher": "felixkrueckel",
   "icon": "media/icon.png",
   "repository": {
@@ -171,6 +171,16 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "warp.saveClaudeWindow",
+          "when": "view == warp.view && warp.hasClaudeTabs",
+          "group": "navigation@1"
+        },
+        {
+          "command": "warp.reopenClaudeWindow",
+          "when": "view == warp.view && warp.hasSavedWindows",
+          "group": "navigation@2"
+        },
         {
           "command": "warp.moveToPanel",
           "when": "view == warp.view && warp.inSideBar",

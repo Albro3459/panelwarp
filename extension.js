@@ -721,7 +721,8 @@ function activate(context) {
 /**
  * Two status bar buttons for saved windows of Claude Code tabs: "Save window" while this window
  * has Claude Code tabs, and "N saved windows" while the list has entries (it is shared by all
- * windows through globalState, so each window re-reads it when it gets focus).
+ * windows through globalState, so each window re-reads it when it gets focus). The same two
+ * buttons sit in the Warp panel's title bar and in the tab row of an active Claude Code tab.
  */
 function savedWindowButtons(context, agents) {
   const save = vscode.window.createStatusBarItem('warp.saveClaudeWindow', vscode.StatusBarAlignment.Right, 90);
@@ -737,9 +738,13 @@ function savedWindowButtons(context, agents) {
     const claudeTabs = vscode.window.tabGroups.all
       .flatMap((group) => group.tabs)
       .filter((tab) => tab.input instanceof vscode.TabInputWebview && /claudeVSCodePanel$/.test(tab.input.viewType));
-    if (claudeTabs.length && vscode.workspace.workspaceFolders?.length) save.show();
+    const canSave = Boolean(claudeTabs.length && vscode.workspace.workspaceFolders?.length);
+    if (canSave) save.show();
     else save.hide();
     const saved = agents.savedWindows();
+    // Context keys for the same two buttons in the Warp panel's title bar (package.json view/title).
+    vscode.commands.executeCommand('setContext', 'warp.hasClaudeTabs', canSave);
+    vscode.commands.executeCommand('setContext', 'warp.hasSavedWindows', saved.length > 0);
     if (saved.length) {
       reopen.text = `$(window) ${saved.length} saved`;
       reopen.show();
