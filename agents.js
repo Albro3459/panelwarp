@@ -6,6 +6,7 @@
 
 const vscode = require('vscode');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -29,6 +30,9 @@ const TAIL_BYTES = 2 * 1024 * 1024;
 // A Claude conversation opened in another folder's new window is handed off through globalState.
 const PENDING_OPEN_KEY = 'warp.pendingClaudeOpen';
 const PENDING_OPEN_MAX_AGE = 2 * 60 * 1000;
+// Windows of Claude Code tabs saved with "Save Window": closed, to be reopened later as a whole.
+const SAVED_WINDOWS_KEY = 'warp.savedWindows';
+const MAX_SAVED_WINDOWS = 50;
 // When each conversation was last seen (agent:id -> ms), shared by all windows, and when this
 // tracking started: turns that finished earlier count as seen.
 const SEEN_KEY = 'warp.agentsSeen';
@@ -36,6 +40,87 @@ const SEEN_KEY = 'warp.agentsSeen';
 // closed or crashed mid-turn). Long tool calls and permission prompts stay under it.
 const STALE_TURN_MS = 30 * 60 * 1000;
 const SEEN_SINCE_KEY = 'warp.agentsSeenSince';
+// Finished turns are checked this often and announced once they're this old, so Warp's own
+// notification for the same turn (WARP_NOTICE_MS either side) can come in first and cover it.
+const FINISHED_CHECK_MS = 10 * 1000;
+const FINISHED_DELAY_MS = 15 * 1000;
+const WARP_NOTICE_MS = 60 * 1000;
+const AGENT_NAMES = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI' };
+// Every window watches; the first to create a turn's file here announces it. The window with the
+// conversation's folder goes first, one with a parent folder of it after CLAIM_PARENT_MS, others
+// after CLAIM_OTHER_MS (more than a check interval each).
+const CLAIM_DIR = path.join(os.tmpdir(), 'panelwarp-finished');
+const CLAIM_PARENT_MS = 12 * 1000;
+const CLAIM_OTHER_MS = 25 * 1000;
+const EXTENSION_ID = 'felixkrueckel.panelwarp';
+// The macOS notifier app (notifier/main.swift; packaged next to extension.js).
+const NOTIFIER_APP = path.join(__dirname, 'notifier', 'Panelwarp.app');
+const NOTIFIER = path.join(NOTIFIER_APP, 'Contents', 'MacOS', 'panelwarp-notifier');
+const LSREGISTER =
+  '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
+
+const fromClaudeExtension = (c) => c.agent === 'claude' && c.entrypoint === 'claude-vscode';
+
+/** This window's workspace folder that is `cwd` or contains it (the deepest), or ''. */
+function folderFor(cwd) {
+  if (!cwd) return '';
+  const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+  const inside = folders.filter((f) => cwd === f || cwd.startsWith(f.endsWith(path.sep) ? f : f + path.sep));
+  return inside.sort((a, b) => b.length - a.length)[0] || '';
+}
+
+/** True for the one window that gets to announce this turn. */
+function claimTurn(key, doneAt) {
+  fs.mkdirSync(CLAIM_DIR, { recursive: true });
+  try {
+    fs.writeFileSync(path.join(CLAIM_DIR, `${key.replace(/[^\w.-]/g, '_')}-${doneAt}`), '', { flag: 'wx' });
+    return true;
+  } catch (error) {
+    if (error.code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+/**
+ * What a click on the macOS notification opens: the window with the conversation's folder (a new
+ * one if none has it), then, for the Claude Code extension, the conversation in its editor tab
+ * (through this extension's URI handler, in that window). Terminal sessions only get their window.
+ */
+function clickUrls(conversation, folder) {
+  const scheme = vscode.env.uriScheme;
+  const target = folder || (fromClaudeExtension(conversation) ? conversation.cwd : '');
+  const urls = [];
+  if (target) urls.push(`${scheme}://file${target.split('/').map(encodeURIComponent).join('/')}/`);
+  if (fromClaudeExtension(conversation)) {
+    urls.push(`${scheme}://${EXTENSION_ID}/open?agent=claude&id=${encodeURIComponent(conversation.id)}`);
+  }
+  return urls;
+}
+
+/**
+ * Tells you a conversation finished. While this window is focused that's a VS Code notification
+ * (with Open for the Claude Code extension's conversations); otherwise, on macOS, a system
+ * notification that brings you to it when clicked.
+ */
+function notifyFinished(conversation, folder, open, log) {
+  // The chat's title as the headline (what its tab shows), the agent below it.
+  const title = conversation.title || 'Conversation';
+  const body = `${AGENT_NAMES[conversation.agent]} finished`;
+  const toast = () => {
+    const actions = fromClaudeExtension(conversation) ? ['Open'] : [];
+    vscode.window.showInformationMessage(`${title} — ${body}`, ...actions).then((choice) => {
+      if (choice === 'Open') return open();
+    }).catch((error) => vscode.window.showErrorMessage(error.message));
+  };
+  if (process.platform !== 'darwin' || vscode.window.state.focused || !fs.existsSync(NOTIFIER)) return toast();
+  // The first notification waits for you to allow them, hence the long timeout.
+  execFile(NOTIFIER, [title, body, ...clickUrls(conversation, folder)], { timeout: 5 * 60 * 1000 }, (error, _out, stderr) => {
+    if (!error) return;
+    log.appendLine(`agents: macOS notification failed (${String(stderr).trim() || error.message}); ` +
+      'allow Panelwarp in System Settings > Notifications');
+    toast();
+  });
+}
 
 function readRange(file, start, length) {
   const fd = fs.openSync(file, 'r');
@@ -144,16 +229,24 @@ const claude = {
       }
       if (cwd && firstPrompt) break;
     }
+    // The chat's title as Claude Code shows it: your rename (`custom-title`, also set by forks)
+    // over its AI title, the newest of each.
     let title = '';
-    // When the latest turn ended (Claude writes `turn_duration` then), or 0 while one runs or
-    // after it was interrupted.
+    let customTitle = '';
+    // When the latest turn ended, or 0 while one runs or after it was interrupted. A turn ends
+    // with an assistant message that stopped on its own (`end_turn`); Claude writes
+    // `turn_duration` after only some turns.
     let doneAt = 0;
     let state = 'idle';
+    // Where the latest turn ran: "claude-vscode" (the Claude Code extension) or "cli".
+    let entrypoint = '';
     for (const entry of jsonLines(file, size, 'tail')) {
-      if (entry.type === 'ai-title' && entry.aiTitle) title = entry.aiTitle;
+      if (entry.type === 'custom-title' && entry.customTitle) customTitle = entry.customTitle;
+      else if (entry.type === 'ai-title' && entry.aiTitle) title = entry.aiTitle;
       else if (entry.type === 'summary' && entry.summary && !title) title = entry.summary;
       if (entry.isSidechain) continue;
-      if (entry.type === 'system' && entry.subtype === 'turn_duration') {
+      const stopped = ['end_turn', 'stop_sequence'].includes(entry.message?.stop_reason);
+      if ((entry.type === 'system' && entry.subtype === 'turn_duration') || (entry.type === 'assistant' && stopped)) {
         doneAt = Date.parse(entry.timestamp) || 0;
         state = 'done';
       } else if ((entry.type === 'user' && !entry.isMeta) || entry.type === 'assistant') {
@@ -162,9 +255,18 @@ const claude = {
           entry.type === 'user' && /^\[Request interrupted by user/.test(contentText(entry.message?.content));
         state = interrupted ? 'idle' : 'working';
       }
+      if (entry.entrypoint && (entry.type === 'user' || entry.type === 'assistant')) entrypoint = entry.entrypoint;
     }
+    // Long sessions: the title can be older than the tail.
+    if (!customTitle && !title) {
+      for (const entry of jsonLines(file, size, 'head')) {
+        if (entry.type === 'custom-title' && entry.customTitle) customTitle = entry.customTitle;
+        else if (entry.type === 'ai-title' && entry.aiTitle) title = entry.aiTitle;
+      }
+    }
+    title = customTitle || title;
     if (!title && !firstPrompt) return null;
-    return { id: path.basename(file, '.jsonl'), title: oneLine(title || firstPrompt), cwd, doneAt, state };
+    return { id: path.basename(file, '.jsonl'), title: oneLine(title || firstPrompt), cwd, doneAt, state, entrypoint };
   },
 
   /** [{role, text}] of the conversation's end. */
@@ -292,10 +394,28 @@ class AgentConversations {
     // Where each listed conversation's file is, so later requests can't name arbitrary files.
     this.known = new Map();
     this.summaryInFlight = null;
+    // When Warp's own notification last came in (see noteWarpNotice).
+    this.warpNoticeAt = 0;
   }
 
   /** JSON array of {agent, id, title, cwd, updatedAt}, newest first. */
   list() {
+    const listed = this.scan();
+    const seen = this.globalState.get(SEEN_KEY) || {};
+    const since = this.seenSince();
+    return JSON.stringify(
+      listed.map(({ doneAt, state, ...conversation }) => ({
+        ...conversation,
+        // `working` while a turn runs; one that stopped writing long ago crashed or was closed.
+        status: state === 'working' && Date.now() - conversation.updatedAt > STALE_TURN_MS ? 'idle' : state,
+        // Its latest turn finished after you last looked at it (here or in its Claude tab).
+        unread: doneAt > Math.max(since, seen[`${conversation.agent}:${conversation.id}`] || 0),
+      })),
+    );
+  }
+
+  /** The newest conversations with doneAt (when their latest turn finished, 0 if none) and state. */
+  scan() {
     const projectRoots = new Map();
     const addRoot = (dir) => dir && projectRoots.set(crypto.createHash('sha256').update(dir).digest('hex'), dir);
     for (const folder of vscode.workspace.workspaceFolders || []) addRoot(folder.uri.fsPath);
@@ -325,17 +445,59 @@ class AgentConversations {
     conversations.sort((a, b) => b.updatedAt - a.updatedAt);
     const listed = conversations.slice(0, MAX_CONVERSATIONS);
     this.markVisibleClaudeTabsSeen(listed);
-    const seen = this.globalState.get(SEEN_KEY) || {};
-    const since = this.seenSince();
-    return JSON.stringify(
-      listed.map(({ doneAt, state, ...conversation }) => ({
-        ...conversation,
-        // `working` while a turn runs; one that stopped writing long ago crashed or was closed.
-        status: state === 'working' && Date.now() - conversation.updatedAt > STALE_TURN_MS ? 'idle' : state,
-        // Its latest turn finished after you last looked at it (here or in its Claude tab).
-        unread: doneAt > Math.max(since, seen[`${conversation.agent}:${conversation.id}`] || 0),
-      })),
-    );
+    return listed;
+  }
+
+  /**
+   * Notifies once when a conversation's turn has finished and nobody has looked at it yet (Claude
+   * Code in the VS Code extension or a terminal, Codex, Gemini). Turns already finished when this
+   * starts aren't announced. Returns a disposable.
+   */
+  watchFinished() {
+    const announced = new Map();
+    for (const conversation of this.scan()) {
+      if (conversation.doneAt) announced.set(`${conversation.agent}:${conversation.id}`, conversation.doneAt);
+    }
+    try {
+      for (const name of fs.existsSync(CLAIM_DIR) ? fs.readdirSync(CLAIM_DIR) : []) {
+        const file = path.join(CLAIM_DIR, name);
+        if (Date.now() - fs.statSync(file).mtimeMs > 24 * 3600 * 1000) fs.rmSync(file);
+      }
+    } catch {}
+    // So macOS can relaunch the notifier for a click on one of its notifications.
+    if (process.platform === 'darwin' && fs.existsSync(NOTIFIER_APP)) execFile(LSREGISTER, ['-f', NOTIFIER_APP], () => {});
+    const timer = setInterval(() => this.announceFinished(announced), FINISHED_CHECK_MS);
+    return { dispose: () => clearInterval(timer) };
+  }
+
+  announceFinished(announced) {
+    try {
+      const since = this.seenSince();
+      const seen = this.globalState.get(SEEN_KEY) || {};
+      for (const conversation of this.scan()) {
+        const { agent, id, doneAt, cwd } = conversation;
+        const key = `${agent}:${id}`;
+        if (!doneAt || (announced.get(key) || 0) >= doneAt) continue;
+        // Wait a little: Warp's own notification for the same turn can arrive a moment later, and
+        // the window with the conversation's folder gets to announce it first.
+        const folder = folderFor(cwd);
+        const wait = FINISHED_DELAY_MS + (!folder ? CLAIM_OTHER_MS : folder === cwd ? 0 : CLAIM_PARENT_MS);
+        if (Date.now() - doneAt < wait) continue;
+        announced.set(key, doneAt);
+        if (doneAt <= Math.max(since, seen[key] || 0)) continue;
+        if (this.warpNoticeAt && Math.abs(this.warpNoticeAt - doneAt) < WARP_NOTICE_MS) continue;
+        if (!claimTurn(key, doneAt)) continue;
+        this.log.appendLine(`agents: ${key} finished; notifying`);
+        notifyFinished(conversation, folder, () => this.open(agent, id), this.log);
+      }
+    } catch (error) {
+      this.log.appendLine(`agents: finished check: ${error.message}`);
+    }
+  }
+
+  /** Warp's own notification (its agent plugin) just came in; it covers the turn it's about. */
+  noteWarpNotice() {
+    this.warpNoticeAt = Date.now();
   }
 
   seenSince() {
@@ -553,19 +715,17 @@ class AgentConversations {
   }
 
   /**
-   * Moves about half of this window's Claude Code tabs, by conversation size, into a new window
-   * of the same folder. Each window has its own extension host and renderer, so this splits the
-   * memory of big conversations (VS Code crashes a process near 4 GB). The half with the tab in
-   * front stays here.
+   * This window's Claude Code editor tabs, each matched to a conversation of the window's
+   * folders. Tabs only tell us their title; each is matched to the newest unclaimed conversation
+   * with that title. `tabs` are all Claude Code tabs, `matched` the ones with a conversation.
    */
-  async splitClaudeTabs(storageDir) {
+  matchClaudeTabs() {
     const tabs = vscode.window.tabGroups.all
       .flatMap((group) => group.tabs)
       .filter((tab) => tab.input instanceof vscode.TabInputWebview && /claudeVSCodePanel$/.test(tab.input.viewType));
     const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
     if (!folders.length) throw new Error('Open a folder first: Claude Code resumes conversations per folder.');
 
-    // Tabs only tell us their title; match each to the newest unclaimed conversation of this folder.
     const conversations = JSON.parse(this.list()).filter((c) => c.agent === 'claude' && folders.includes(c.cwd));
     const matched = [];
     const claimed = new Set();
@@ -582,8 +742,19 @@ class AgentConversations {
       try {
         size = this.entry('claude', conversation.id).size;
       } catch {}
-      matched.push({ tab, id: conversation.id, cwd: conversation.cwd, size });
+      matched.push({ tab, id: conversation.id, cwd: conversation.cwd, title: conversation.title, size });
     }
+    return { tabs, matched, folders };
+  }
+
+  /**
+   * Moves about half of this window's Claude Code tabs, by conversation size, into a new window
+   * of the same folder. Each window has its own extension host and renderer, so this splits the
+   * memory of big conversations (VS Code crashes a process near 4 GB). The half with the tab in
+   * front stays here.
+   */
+  async splitClaudeTabs(storageDir) {
+    const { tabs, matched, folders } = this.matchClaudeTabs();
     if (matched.length < 2) {
       throw new Error(
         `Found ${tabs.length} Claude Code tab${tabs.length === 1 ? '' : 's'} here` +
@@ -605,17 +776,7 @@ class AgentConversations {
     const moving = halves.find((half) => !half.tabs.some((m) => m.tab.isActive && m.tab.group.isActive)) || halves[1];
 
     // The same folder can't be open in two windows, but a workspace file listing it can.
-    const dir = path.join(storageDir, 'split-windows');
-    fs.mkdirSync(dir, { recursive: true });
-    for (const name of fs.readdirSync(dir)) {
-      const file = path.join(dir, name);
-      try {
-        if (Date.now() - fs.statSync(file).mtimeMs > 30 * 24 * 3600 * 1000) fs.rmSync(file);
-      } catch {}
-    }
-    const name = `${path.basename(folders[0])} ${new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '.')}`;
-    const workspaceFile = path.join(dir, `${name.replace(/[^\w .-]/g, '_')}.code-workspace`);
-    fs.writeFileSync(workspaceFile, JSON.stringify({ folders: folders.map((folder) => ({ path: folder })) }, null, 2));
+    const workspaceFile = writeWorkspaceFile(storageDir, folders);
 
     const ids = moving.tabs.map((m) => m.id);
     await this.globalState.update(PENDING_OPEN_KEY, { folder: folders[0], ids, at: Date.now() });
@@ -625,6 +786,107 @@ class AgentConversations {
     this.log.appendLine(`agents: moved ${ids.length} of ${matched.length} Claude tabs to a new window`);
     return { moved: ids.length, total: matched.length };
   }
+
+  /** The saved windows, newest first. */
+  savedWindows() {
+    const saved = this.globalState.get(SAVED_WINDOWS_KEY);
+    return Array.isArray(saved) ? saved : [];
+  }
+
+  /**
+   * Saves this window's Claude Code tabs (conversation ids, their editor groups, which is in
+   * front) to the saved windows list, closes the tabs and then the window. `reopenWindow` brings
+   * them all back. The tabs are closed first so VS Code doesn't restore them itself the next
+   * time the folder opens (it would, through Claude Code's webview serializer), which would
+   * double them up when the saved window is reopened.
+   */
+  async saveWindow(storageDir) {
+    const { tabs, matched, folders } = this.matchClaudeTabs();
+    if (!matched.length) {
+      throw new Error(
+        tabs.length
+          ? `None of the ${tabs.length} Claude Code tab${tabs.length === 1 ? '' : 's'} here matched a conversation of this folder.`
+          : 'No Claude Code tabs in this window.',
+      );
+    }
+    const groups = vscode.window.tabGroups.all;
+    // A multi-root window keeps its workspace file (or gets one) so it reopens with all folders.
+    let workspaceFile;
+    const current = vscode.workspace.workspaceFile;
+    if (folders.length > 1) {
+      workspaceFile = current?.scheme === 'file' && fs.existsSync(current.fsPath) ? current.fsPath : writeWorkspaceFile(storageDir, folders);
+    }
+    const saved = {
+      id: crypto.randomUUID(),
+      savedAt: Date.now(),
+      folders,
+      workspaceFile,
+      tabs: matched.map((m) => ({
+        id: m.id,
+        title: m.title,
+        group: Math.max(0, groups.indexOf(m.tab.group)),
+        active: m.tab.isActive,
+        focused: m.tab.isActive && m.tab.group.isActive,
+      })),
+    };
+    const list = [saved, ...this.savedWindows()].slice(0, MAX_SAVED_WINDOWS);
+    await this.globalState.update(SAVED_WINDOWS_KEY, list);
+    this.onDidChangeSavedWindows?.();
+    await vscode.window.tabGroups.close(matched.map((m) => m.tab));
+    this.log.appendLine(`agents: saved window with ${matched.length} Claude tabs (${folders.join(', ')})`);
+    await vscode.commands.executeCommand('workbench.action.closeWindow');
+    return { saved: matched.length, total: tabs.length, unmatched: tabs.length - matched.length };
+  }
+
+  /**
+   * Reopens a saved window: its folder (or workspace file) opens in a new window, whose instance
+   * of this extension opens the conversations (openPendingClaudeConversation) in their groups.
+   * The entry leaves the list; a window that failed to open stays. If the folder is already open
+   * in a window, VS Code brings that window forward and the tabs open there.
+   */
+  async reopenWindow(id) {
+    const saved = this.savedWindows().find((w) => w.id === id);
+    if (!saved) throw new Error('That saved window is gone.');
+    const target = saved.workspaceFile && fs.existsSync(saved.workspaceFile) ? saved.workspaceFile : saved.folders[0];
+    if (!target || !fs.existsSync(target)) throw new Error(`folder no longer exists: ${saved.folders[0]}`);
+    await this.globalState.update(PENDING_OPEN_KEY, {
+      folder: saved.folders[0],
+      ids: saved.tabs.map((t) => t.id),
+      tabs: saved.tabs,
+      at: Date.now(),
+    });
+    await this.forgetWindow(id);
+    const here = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+    this.log.appendLine(`agents: reopening saved window with ${saved.tabs.length} Claude tabs (${target})`);
+    await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(target), { forceNewWindow: here.length > 0 });
+  }
+
+  async forgetWindow(id) {
+    await this.globalState.update(
+      SAVED_WINDOWS_KEY,
+      this.savedWindows().filter((w) => w.id !== id),
+    );
+    this.onDidChangeSavedWindows?.();
+  }
+}
+
+/**
+ * A workspace file listing the folders, in the extension's storage (old ones are cleaned up),
+ * so a folder that is already open in one window can open in another.
+ */
+function writeWorkspaceFile(storageDir, folders) {
+  const dir = path.join(storageDir, 'split-windows');
+  fs.mkdirSync(dir, { recursive: true });
+  for (const name of fs.readdirSync(dir)) {
+    const file = path.join(dir, name);
+    try {
+      if (Date.now() - fs.statSync(file).mtimeMs > 30 * 24 * 3600 * 1000) fs.rmSync(file);
+    } catch {}
+  }
+  const name = `${path.basename(folders[0])} ${new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '.')}`;
+  const workspaceFile = path.join(dir, `${name.replace(/[^\w .-]/g, '_')}.code-workspace`);
+  fs.writeFileSync(workspaceFile, JSON.stringify({ folders: folders.map((folder) => ({ path: folder })) }, null, 2));
+  return workspaceFile;
 }
 
 /** On activation: opens Claude conversations another window handed to this window's folder. */
@@ -640,12 +902,34 @@ async function openPendingClaudeConversation(globalState, log) {
   await globalState.update(PENDING_OPEN_KEY, undefined);
   try {
     await vscode.extensions.getExtension('anthropic.claude-code')?.activate();
+    if (pending.tabs) {
+      await openClaudeTabsInGroups(pending.tabs);
+      return;
+    }
     for (const id of pending.ids || [pending.id]) {
       await vscode.commands.executeCommand('claude-vscode.editor.open', id);
     }
   } catch (error) {
     log.appendLine(`agents: could not open Claude conversation: ${error.message}`);
   }
+}
+
+/**
+ * Opens saved Claude Code tabs back into their editor groups (side by side; groups are created
+ * as needed). Each opens in the first group and is moved right `group` times; the tab that was in
+ * front in each group opens last, so it is in front again, and the focused group gets focus.
+ */
+async function openClaudeTabsInGroups(tabs) {
+  const run = (command) => vscode.commands.executeCommand(command);
+  const ordered = [...tabs].sort((a, b) => (a.group || 0) - (b.group || 0) || Number(!!a.active) - Number(!!b.active));
+  for (const tab of ordered) {
+    await run('workbench.action.focusFirstEditorGroup');
+    await vscode.commands.executeCommand('claude-vscode.editor.open', tab.id);
+    for (let i = 0; i < (tab.group || 0); i++) await run('workbench.action.moveEditorToNextGroup');
+  }
+  const focused = tabs.find((t) => t.focused) || tabs.find((t) => t.active) || tabs[0];
+  await run('workbench.action.focusFirstEditorGroup');
+  for (let i = 0; i < (focused?.group || 0); i++) await run('workbench.action.focusNextGroup');
 }
 
 /** A title for matching tab labels: one line, no ellipsis, at least a few characters. */
@@ -656,4 +940,4 @@ function normalizeTitle(text) {
 
 const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
-module.exports = { AgentConversations, openPendingClaudeConversation };
+module.exports = { AgentConversations, openPendingClaudeConversation, openClaudeTabsInGroups };

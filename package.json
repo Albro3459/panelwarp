@@ -2,7 +2,7 @@
   "name": "panelwarp",
   "displayName": "Warp Terminal for VS Code",
   "description": "An unofficial fork of the open-source Warp terminal, running in a VS Code panel tab next to Terminal: blocks, command search, completions and BYOK AI. Not affiliated with Warp.",
-  "version": "0.1.13",
+  "version": "0.1.17",
   "publisher": "felixkrueckel",
   "icon": "media/icon.png",
   "repository": {
@@ -29,7 +29,8 @@
   },
   "main": "./extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onUri"
   ],
   "contributes": {
     "viewsContainers": {
@@ -85,6 +86,11 @@
       {
         "command": "warp.closeTab",
         "title": "Close Tab",
+        "category": "Warp"
+      },
+      {
+        "command": "warp.reopenClosedTab",
+        "title": "Reopen Closed Tab",
         "category": "Warp"
       },
       {
@@ -149,6 +155,18 @@
         "title": "Move Half of the Claude Code Tabs to a New Window",
         "category": "Warp",
         "icon": "$(split-horizontal)"
+      },
+      {
+        "command": "warp.saveClaudeWindow",
+        "title": "Save Window (Claude Code Tabs) and Close It",
+        "category": "Warp",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "warp.reopenClaudeWindow",
+        "title": "Reopen a Saved Window",
+        "category": "Warp",
+        "icon": "$(window)"
       }
     ],
     "menus": {
@@ -173,8 +191,47 @@
           "command": "warp.moveToSideBar",
           "when": "!warp.inSideBar"
         }
+      ],
+      "editor/title": [
+        {
+          "command": "warp.saveClaudeWindow",
+          "when": "activeWebviewPanelId == claudeVSCodePanel",
+          "group": "navigation@90"
+        },
+        {
+          "command": "warp.reopenClaudeWindow",
+          "when": "activeWebviewPanelId == claudeVSCodePanel",
+          "group": "navigation@91"
+        }
       ]
-    }
+    },
+    "keybindings": [
+      {
+        "key": "ctrl+`",
+        "command": "warp.show",
+        "when": "focusedView != 'warp.view'"
+      },
+      {
+        "key": "ctrl+`",
+        "command": "workbench.action.closePanel",
+        "when": "focusedView == 'warp.view' && !warp.inSideBar"
+      },
+      {
+        "key": "ctrl+`",
+        "command": "workbench.action.closeSidebar",
+        "when": "focusedView == 'warp.view' && warp.inSideBar"
+      },
+      {
+        "key": "cmd+w",
+        "command": "warp.closeTab",
+        "when": "focusedView == 'warp.view' || panelFocus && activePanel == 'workbench.view.extension.warp' || sideBarFocus && activeViewlet == 'workbench.view.extension.warp-launcher'"
+      },
+      {
+        "key": "cmd+shift+t",
+        "command": "warp.reopenClosedTab",
+        "when": "focusedView == 'warp.view' || panelFocus && activePanel == 'workbench.view.extension.warp' || sideBarFocus && activeViewlet == 'workbench.view.extension.warp-launcher'"
+      }
+    ]
   },
   "dependencies": {
     "node-pty": "^1.1.0",

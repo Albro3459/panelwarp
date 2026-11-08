@@ -26,6 +26,7 @@ const WARP_KEYS = {
   'warp.commandPalette': { key: 'p', code: 'KeyP', cmd: true },
   'warp.newTab': { key: 't', code: 'KeyT', cmd: true },
   'warp.closeTab': { key: 'w', code: 'KeyW', cmd: true },
+  'warp.reopenClosedTab': { key: 'T', code: 'KeyT', cmd: true, shift: true },
   'warp.nextTab': { key: '}', code: 'BracketRight', cmd: true, shift: true },
   'warp.previousTab': { key: '{', code: 'BracketLeft', cmd: true, shift: true },
   'warp.splitRight': { key: 'd', code: 'KeyD', cmd: true },
@@ -46,7 +47,7 @@ function resolveBundleDir() {
   // scripts/build-warp.sh builds one of these profiles; load the most recently built bundle.
   let newest;
   for (const profile of ['wasm-fast', 'wasm-thin', 'release-wasm', 'dev-wasm']) {
-    const dir = path.join(os.homedir(), 'src/warp/target/wasm32-unknown-unknown', profile, 'bundle');
+    const dir = path.join(os.homedir(), 'Library/Caches/warp-target/wasm32-unknown-unknown', profile, 'bundle');
     try {
       if (!fs.existsSync(path.join(dir, 'wasm', 'warp.js'))) continue;
       const mtime = fs.statSync(path.join(dir, 'wasm', 'warp_bg.wasm')).mtimeMs;
@@ -92,6 +93,79 @@ async function externalUrl(url) {
 }
 
 const IN_SIDE_BAR_KEY = 'warp.inSideBar';
+const TERMINAL_KEY_FREED_KEY = 'warp.terminalShortcutFreed';
+
+/**
+ * Ctrl+` is Warp's shortcut (package.json). Once per install this takes it away from VS Code's own
+ * terminal toggle in the user's keybindings.json (so the two never compete) and lets it through
+ * VS Code's integrated terminal (which would otherwise send it to its shell). Done once, so a
+ * user who adds the terminal binding back keeps it.
+ */
+async function freeTerminalShortcut(context, log) {
+  if (context.globalState.get(TERMINAL_KEY_FREED_KEY)) return;
+  try {
+    // globalStorage is <user data>/User/globalStorage/<extension>.
+    const file = path.join(context.globalStorageUri.fsPath, '..', '..', 'keybindings.json');
+    const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    if (!text.includes('-workbench.action.terminal.toggleTerminal')) {
+      const entry = '{ "key": "ctrl+`", "command": "-workbench.action.terminal.toggleTerminal" }';
+      fs.writeFileSync(file, addJsoncArrayEntry(text, entry));
+      log.appendLine(`removed VS Code's Ctrl+\` terminal toggle in ${file} (Warp uses it)`);
+    }
+    const terminal = vscode.workspace.getConfiguration('terminal.integrated');
+    const skip = terminal.inspect('commandsToSkipShell')?.globalValue || [];
+    if (!skip.includes('warp.show')) {
+      await terminal.update('commandsToSkipShell', [...skip, 'warp.show'], vscode.ConfigurationTarget.Global);
+    }
+    await context.globalState.update(TERMINAL_KEY_FREED_KEY, true);
+  } catch (error) {
+    log.appendLine(`could not free Ctrl+\` from VS Code's terminal: ${error.message}`);
+  }
+}
+
+/** `text` (a JSONC array, possibly empty or missing) with `entry` added as its last element. */
+function addJsoncArrayEntry(text, entry) {
+  // The top-level array's brackets and its last element's last character (-1: empty), skipping
+  // strings and comments.
+  let open = -1;
+  let close = -1;
+  let last = -1;
+  let comma = -1;
+  let depth = 0;
+  for (let i = 0; i < text.length && close === -1; i++) {
+    const c = text[i];
+    if (c === '/' && text[i + 1] === '/') {
+      const end = text.indexOf('\n', i);
+      i = end === -1 ? text.length : end;
+      continue;
+    }
+    if (c === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      i = end === -1 ? text.length : end + 1;
+      continue;
+    }
+    if (c === '"') for (i++; i < text.length && text[i] !== '"'; i++) if (text[i] === '\\') i++;
+    if (c === '[' || c === '{') {
+      depth++;
+      if (open === -1) {
+        open = i;
+        continue;
+      }
+    } else if (c === ']' || c === '}') {
+      depth--;
+      if (depth === 0) {
+        close = i;
+        continue;
+      }
+    }
+    if (c === ',') comma = i;
+    else if (open !== -1 && !/\s/.test(c)) last = i;
+  }
+  if (open === -1 || close === -1) return `[\n  ${entry}\n]\n`;
+  const separator = comma > last ? '' : ',';
+  const head = last === -1 ? text.slice(0, open + 1) : `${text.slice(0, last + 1)}${separator}${text.slice(last + 1, close).replace(/\s*$/, '')}`;
+  return `${head}\n  ${entry}\n${text.slice(close)}`;
+}
 
 /** Moves the Warp view between the bottom panel and the activity bar's side bar container. */
 async function moveWarpView(context, toSideBar) {
@@ -337,6 +411,7 @@ class WarpViewProvider {
         }
         break;
       case 'warp-notify':
+        this.agents.noteWarpNotice();
         this.notify(String(msg.title).slice(0, 200), String(msg.body).slice(0, 500));
         break;
       case 'warp-request-focus':
@@ -545,7 +620,26 @@ function activate(context) {
   provider.agents = new AgentConversations(context.globalState, log, provider.ai, () =>
     provider.panelSettings.ai(),
   );
+  freeTerminalShortcut(context, log);
+  context.subscriptions.push(provider.agents.watchFinished());
   openPendingClaudeConversation(context.globalState, log);
+  context.subscriptions.push(
+    // A click on a finished-agent notification: vscode://felixkrueckel.panelwarp/open?agent=claude&id=…
+    vscode.window.registerUriHandler({
+      handleUri(uri) {
+        const params = new URLSearchParams(uri.query);
+        if (uri.path !== '/open' || params.get('agent') !== 'claude' || !params.get('id')) return;
+        provider.agents.open('claude', params.get('id'), 'editor').catch((error) => {
+          log.appendLine(`agents: could not open ${params.get('id')}: ${error.message}`);
+          vscode.window.showErrorMessage(`Could not open the conversation: ${error.message}`);
+        });
+      },
+    }),
+    // The conversation's folder may already be open in this window when another one hands it over.
+    vscode.window.onDidChangeWindowState((state) => {
+      if (state.focused) openPendingClaudeConversation(context.globalState, log);
+    }),
+  );
   // Warp reads its settings once at startup, so the panel waits for this.
   provider.ready = provider.panelSettings
     .migrateFromVSCodeSettings()
@@ -597,7 +691,22 @@ function activate(context) {
         vscode.window.showWarningMessage(error.message);
       }
     }),
+    vscode.commands.registerCommand('warp.saveClaudeWindow', async () => {
+      try {
+        await provider.agents.saveWindow(context.globalStorageUri.fsPath);
+      } catch (error) {
+        vscode.window.showWarningMessage(error.message);
+      }
+    }),
+    vscode.commands.registerCommand('warp.reopenClaudeWindow', () => pickSavedWindow(provider.agents, log)),
+    ...savedWindowButtons(context, provider.agents),
     vscode.commands.registerCommand('warp.show', () => vscode.commands.executeCommand('warp.view.focus')),
+    // Ctrl+` inside Warp (routed by host.html): closes the panel or side bar Warp is in.
+    vscode.commands.registerCommand('warp.hide', async () => {
+      const inSideBar = context.globalState.get(IN_SIDE_BAR_KEY, false);
+      await vscode.commands.executeCommand(inSideBar ? 'workbench.action.closeSidebar' : 'workbench.action.closePanel');
+      await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+    }),
     vscode.commands.registerCommand('warp.restart', () => provider.restart()),
     vscode.commands.registerCommand('warp.benchmarkCommandSearch', () => provider.ai.benchmark()),
     vscode.commands.registerCommand('warp.setOpenRouterApiKey', () =>
@@ -607,6 +716,97 @@ function activate(context) {
       vscode.commands.registerCommand(command, () => provider.sendWarpKey(keystroke)),
     ),
   );
+}
+
+/**
+ * Two status bar buttons for saved windows of Claude Code tabs: "Save window" while this window
+ * has Claude Code tabs, and "N saved windows" while the list has entries (it is shared by all
+ * windows through globalState, so each window re-reads it when it gets focus).
+ */
+function savedWindowButtons(context, agents) {
+  const save = vscode.window.createStatusBarItem('warp.saveClaudeWindow', vscode.StatusBarAlignment.Right, 90);
+  save.name = 'Warp: Save Window';
+  save.text = '$(archive) Save window';
+  save.tooltip = "Save this window's Claude Code conversations to the saved windows and close it";
+  save.command = 'warp.saveClaudeWindow';
+  const reopen = vscode.window.createStatusBarItem('warp.reopenClaudeWindow', vscode.StatusBarAlignment.Right, 89);
+  reopen.name = 'Warp: Saved Windows';
+  reopen.tooltip = 'Reopen a saved window of Claude Code conversations';
+  reopen.command = 'warp.reopenClaudeWindow';
+  const refresh = () => {
+    const claudeTabs = vscode.window.tabGroups.all
+      .flatMap((group) => group.tabs)
+      .filter((tab) => tab.input instanceof vscode.TabInputWebview && /claudeVSCodePanel$/.test(tab.input.viewType));
+    if (claudeTabs.length && vscode.workspace.workspaceFolders?.length) save.show();
+    else save.hide();
+    const saved = agents.savedWindows();
+    if (saved.length) {
+      reopen.text = `$(window) ${saved.length} saved`;
+      reopen.show();
+    } else {
+      reopen.hide();
+    }
+  };
+  refresh();
+  agents.onDidChangeSavedWindows = refresh;
+  return [
+    save,
+    reopen,
+    vscode.window.tabGroups.onDidChangeTabs(refresh),
+    vscode.window.tabGroups.onDidChangeTabGroups(refresh),
+    vscode.workspace.onDidChangeWorkspaceFolders(refresh),
+    vscode.window.onDidChangeWindowState((state) => state.focused && refresh()),
+  ];
+}
+
+/** Quick pick of the saved windows: pick one to reopen it, or its trash button to forget it. */
+async function pickSavedWindow(agents, log) {
+  const saved = agents.savedWindows();
+  if (!saved.length) {
+    vscode.window.showInformationMessage('No saved windows. "Warp: Save Window" saves the Claude Code tabs of a window.');
+    return;
+  }
+  const trash = { iconPath: new vscode.ThemeIcon('trash'), tooltip: 'Forget this saved window' };
+  const items = saved.map((w) => ({
+    label: `$(window) ${w.folders.map((f) => path.basename(f)).join(', ')}`,
+    description: `${w.tabs.length} conversation${w.tabs.length === 1 ? '' : 's'} · saved ${timeAgo(w.savedAt)}`,
+    detail: w.tabs.map((t) => t.title).filter(Boolean).join(' · '),
+    buttons: [trash],
+    saved: w,
+  }));
+  const pick = vscode.window.createQuickPick();
+  pick.title = 'Saved windows';
+  pick.placeholder = 'Reopen a window with its Claude Code conversations';
+  pick.matchOnDescription = true;
+  pick.matchOnDetail = true;
+  pick.items = items;
+  const chosen = await new Promise((resolve) => {
+    pick.onDidTriggerItemButton(async (event) => {
+      await agents.forgetWindow(event.item.saved.id);
+      pick.items = pick.items.filter((item) => item !== event.item);
+      if (!pick.items.length) pick.hide();
+    });
+    pick.onDidAccept(() => resolve(pick.selectedItems[0]));
+    pick.onDidHide(() => resolve(undefined));
+    pick.show();
+  });
+  pick.dispose();
+  if (!chosen) return;
+  try {
+    await agents.reopenWindow(chosen.saved.id);
+  } catch (error) {
+    log.appendLine(`agents: could not reopen saved window: ${error.message}`);
+    vscode.window.showWarningMessage(`Could not reopen the saved window: ${error.message}`);
+  }
+}
+
+function timeAgo(timestamp) {
+  const minutes = Math.round((Date.now() - timestamp) / 60000);
+  if (minutes < 2) return 'just now';
+  if (minutes < 90) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 36) return `${hours} h ago`;
+  return `${Math.round(hours / 24)} d ago`;
 }
 
 function deactivate() {}

@@ -1,0 +1,27 @@
+From aec9ce4b871c5c546014a9db1ef531e60ed0f8dc Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Mon, 19 Oct 2026 00:16:28 -0700
+Subject: [PATCH 62/64] Build output directory overridable with WARP_TARGET_DIR
+
+Lets the VS Code panel's build scripts keep the ~60 GB of build output out of the
+Google-Drive-synced source folder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ script/wasm/bundle | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/script/wasm/bundle b/script/wasm/bundle
+index f6dec46..84b611b 100755
+--- a/script/wasm/bundle
++++ b/script/wasm/bundle
+@@ -16,7 +16,8 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
+ fi
+ 
+ WORKSPACE_ROOT_DIR="$(pwd)"
+-CARGO_TARGET_DIR="$WORKSPACE_ROOT_DIR/target/wasm32-unknown-unknown"
++# WARP_TARGET_DIR moves the build output out of the source tree (e.g. out of a synced folder).
++CARGO_TARGET_DIR="${WARP_TARGET_DIR:-$WORKSPACE_ROOT_DIR/target}/wasm32-unknown-unknown"
+ 
+ # By default we build dev bundles.
+ RELEASE_CHANNEL="dev"

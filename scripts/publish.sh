@@ -1,18 +1,18 @@
 #!/bin/bash
-# Publishes the extension to the VS Code Marketplace for every supported platform.
+# Publishes the extension to the VS Code Marketplace for macOS (Apple silicon and Intel; macOS only
+# since 0.1.14, so Linux stays on 0.1.13).
 #   scripts/publish.sh [--skip-build]
 # Bump "version" in package.json first. Runs the release Warp build (unless --skip-build), packages
 # one VSIX per platform (scripts/package.sh) and uploads them all with vsce, which reads the token
 # saved by `npx @vscode/vsce login felixkrueckel` (or VSCE_PAT).
-# Linux needs node-pty built on Linux first: see scripts/linux-node-pty/README.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-TARGETS=(darwin-arm64 darwin-x64 linux-x64 linux-arm64)
+TARGETS=(darwin-arm64 darwin-x64)
 VERSION=$(node -p 'require("./package.json").version')
 
 for target in "${TARGETS[@]}"; do
   [ -d "node_modules/node-pty/prebuilds/$target" ] || {
-    echo "no node-pty prebuild for $target (see scripts/linux-node-pty/README.md)"
+    echo "no node-pty prebuild for $target"
     exit 2
   }
 done
@@ -23,12 +23,10 @@ done
 
 [ "${1:-}" = --skip-build ] || scripts/build-warp.sh --release --note "Release build for $VERSION"
 
-# Two at a time: each one brotli-compresses ~200 MB.
+# Both at once: each one brotli-compresses ~200 MB.
 rm -f panelwarp-*.vsix
-for pair in "darwin-arm64 darwin-x64" "linux-x64 linux-arm64"; do
-  for target in $pair; do scripts/package.sh "$target" >"/tmp/panelwarp-package-$target.log" 2>&1 & done
-  wait
-done
+for target in "${TARGETS[@]}"; do scripts/package.sh "$target" >"/tmp/panelwarp-package-$target.log" 2>&1 & done
+wait
 for target in "${TARGETS[@]}"; do
   [ -f "panelwarp-$target.vsix" ] || { tail -20 "/tmp/panelwarp-package-$target.log"; exit 1; }
 done

@@ -1,0 +1,133 @@
+From 611795d88b1138bc961778fe700c964e2f08d98e Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Mon, 19 Oct 2026 01:16:37 -0700
+Subject: [PATCH 64/64] Reopen a closed tab with its running shell in embedded
+ builds
+
+Closing a tab whose command was still running shut that pane's PTY down right away, as on
+desktop, so Cmd+Shift+T (Reopen Closed Session) could only bring back a dead tab. On the web the
+shutdown never reached the PTY host either: the remote event loop dropped Shutdown, so every
+closed tab's shell lived on until the host's 10-minute timeout for disconnected shells.
+
+Embedded builds now leave the running program alone on close, so reopening within the undo
+window (60 s, Undo close settings) brings back the same shell with its program, blocks and
+directory. Once the close is final (the remote TerminalManager's Closed detach, which also covers
+undo turned off and closed split panes), Shutdown goes to the PTY host as {"close":true}, which
+ends the shell.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/terminal/remote_tty/event_loop.rs       |  9 +++++++--
+ app/src/terminal/remote_tty/terminal_manager.rs | 14 ++++++++++++++
+ app/src/workspace/view.rs                       | 16 ++++++++++------
+ 3 files changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/app/src/terminal/remote_tty/event_loop.rs b/app/src/terminal/remote_tty/event_loop.rs
+index 28aa4e8..3cb5b21 100644
+--- a/app/src/terminal/remote_tty/event_loop.rs
++++ b/app/src/terminal/remote_tty/event_loop.rs
+@@ -430,6 +430,7 @@ impl EventLoop {
+                     }
+ 
+                     for message in batch {
++                        let is_shutdown = matches!(message, EventLoopMessage::Shutdown);
+                         let Some(outgoing) = Self::to_outgoing(message) else {
+                             continue;
+                         };
+@@ -456,6 +457,9 @@ impl EventLoop {
+                                 Err(_) => return,
+                             }
+                         }
++                        if is_shutdown {
++                            return;
++                        }
+                     }
+                 }
+             })
+@@ -484,8 +488,9 @@ impl EventLoop {
+                 // make this distinction.
+                 Some(Outgoing::Text(serialized))
+             }
+-            // TODO(alokedesai): Implement shutdown on the network backed PTY.
+-            EventLoopMessage::Shutdown | EventLoopMessage::ChildExited => None,
++            // The PTY host ends the shell (the pane was closed for good).
++            EventLoopMessage::Shutdown => Some(Outgoing::Text(r#"{"close":true}"#.to_owned())),
++            EventLoopMessage::ChildExited => None,
+         }
+     }
+ 
+diff --git a/app/src/terminal/remote_tty/terminal_manager.rs b/app/src/terminal/remote_tty/terminal_manager.rs
+index f8814d6..b532c23 100644
+--- a/app/src/terminal/remote_tty/terminal_manager.rs
++++ b/app/src/terminal/remote_tty/terminal_manager.rs
+@@ -12,6 +12,7 @@ use crate::ai::blocklist::InputConfig;
+ use crate::ai::blocklist::SerializedBlockListItem;
+ use crate::context_chips::prompt_type::PromptType;
+ use crate::pane_group::TerminalViewResources;
++use crate::pane_group::pane::DetachType;
+ use crate::persistence::ModelEvent;
+ use crate::terminal::event_listener::ChannelEventListener;
+ use crate::terminal::model::session::Sessions;
+@@ -41,6 +42,9 @@ pub struct TerminalManager {
+ 
+     _event_loop: ModelHandle<EventLoop>,
+ 
++    /// Tells the event loop to end the remote shell once its pane is closed for good.
++    event_loop_tx: Sender<Message>,
++
+     _view: ViewHandle<TerminalView>,
+ }
+ #[cfg_attr(not(feature = "remote_tty"), allow(dead_code))]
+@@ -189,6 +193,7 @@ impl TerminalManager {
+             _view: view,
+             _pty_controller: pty_controller,
+             _event_loop: event_loop,
++            event_loop_tx,
+         };
+ 
+         let manager_model = ctx.add_model(|_ctx| {
+@@ -231,6 +236,15 @@ impl super::super::TerminalManager for TerminalManager {
+         self.model.clone()
+     }
+ 
++    fn on_view_detached(&self, detach_type: DetachType, _app: &mut AppContext) {
++        // A closed tab's shell keeps running while the close can be undone (the pane is only
++        // hidden); once it's closed for good, the PTY host ends the shell. Without this it would
++        // outlive the pane until the host's timeout for disconnected shells.
++        if matches!(detach_type, DetachType::Closed) {
++            let _ = self.event_loop_tx.try_send(Message::Shutdown);
++        }
++    }
++
+     fn as_any(&self) -> &dyn std::any::Any {
+         self
+     }
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index e56118a..23eaaed 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -12428,14 +12428,18 @@ impl Workspace {
+         if !re_adopted && detach_panes_for_close {
+             let working_directories_model = self.working_directories_model.clone();
+             pane_group.update(ctx, |pane_group, ctx| {
++                // Embedded builds keep a closed tab's running program alive while the close can
++                // be undone (Cmd+Shift+T brings it back running, like a reloaded page does); the
++                // shell ends when the close is final (the remote TerminalManager's detach).
+                 pane_group.for_all_terminal_panes(
+                     |terminal_view, ctx| {
+-                        if terminal_view
+-                            .model
+-                            .lock()
+-                            .block_list()
+-                            .active_block()
+-                            .is_active_and_long_running()
++                        if !cfg!(feature = "remote_tty")
++                            && terminal_view
++                                .model
++                                .lock()
++                                .block_list()
++                                .active_block()
++                                .is_active_and_long_running()
+                         {
+                             terminal_view.shutdown_pty(ctx);
+                         }

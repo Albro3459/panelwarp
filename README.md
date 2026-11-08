@@ -23,8 +23,12 @@ Open the **Warp** tab in the bottom panel (View → Open View… → Warp). Warp
 actions that collide with VS Code shortcuts are in the Command Palette under "Warp: …". To
 use AI features, run **Warp: Set OpenRouter API Key**.
 
-Platforms: macOS (Apple silicon and Intel) and Linux (x64, arm64; also in Remote SSH, WSL and
-container windows). Windows is planned.
+Windows full of Claude Code conversations can be put away and brought back: **Save window**
+in the status bar (or the archive button on a Claude Code tab) saves the window's conversations
+and their layout to a list and closes the window; **N saved** in the status bar (or **Warp:
+Reopen a Saved Window**) reopens one with all its conversations.
+
+Platform: macOS (Apple silicon and Intel).
 
 ## Source and license
 

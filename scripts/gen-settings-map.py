@@ -4,11 +4,11 @@
 Web Warp stores settings in localStorage under each setting's storage key (its Rust type name
 unless `storage_key:` overrides it, see crates/settings/src/macros.rs); desktop Warp's
 settings.toml uses `toml_path`. The extension needs both to offer a real settings file.
-Usage: gen-settings-map.py [warp source dir] (default ~/src/warp)
+Usage: gen-settings-map.py [warp source dir] (default ~/Documents/programming/warp)
 """
 import json, os, re, sys
 
-src = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser('~/src/warp')
+src = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser('~/Documents/programming/warp')
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'media', 'settings-map.json')
 start = re.compile(r'\b[a-z_][a-z0-9_]*:\s*([A-Z][A-Za-z0-9]*)\s*\{')
 enum_start = re.compile(r'implement_setting_for_enum!\(\s*([A-Z][A-Za-z0-9]*)\s*,')

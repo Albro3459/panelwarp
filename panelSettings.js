@@ -33,7 +33,8 @@ const DEFAULT_KEYS_TO_VSCODE = {
   'cmd+shift+e': 'workbench.view.explorer',
   'cmd+shift+f': 'workbench.view.search',
   'cmd+shift+g': 'workbench.view.scm',
-  'ctrl+`': 'workbench.action.terminal.toggleTerminal',
+  // Warp's own shortcut (VS Code's terminal one, which it replaces): inside Warp it closes Warp.
+  'ctrl+`': 'warp.hide',
   // Warp would otherwise take Cmd+Q as its own (no-op) quit.
   'cmd+q': 'workbench.action.quit',
 };

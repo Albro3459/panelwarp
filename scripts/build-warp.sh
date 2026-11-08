@@ -9,9 +9,13 @@
 # The panel loads whichever bundle was built most recently (see resolveBundleDir in extension.js).
 set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WARP_SRC="${WARP_SRC:-$HOME/src/warp}"
+WARP_SRC="${WARP_SRC:-$HOME/Documents/programming/warp}"
 LOG="${LOG:-/tmp/warp-panel-build.log}"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+# Build output lives outside the source folder (~60 GB; Google Drive syncs ~/Documents).
+export WARP_TARGET_DIR="${WARP_TARGET_DIR:-$HOME/Library/Caches/warp-target}"
+# Cargo itself (Warp's bundle script only uses WARP_TARGET_DIR to find the output).
+export CARGO_BUILD_TARGET_DIR="$WARP_TARGET_DIR"
 PROFILE=wasm-fast
 NOTE=""
 while [ $# -gt 0 ]; do
@@ -30,7 +34,7 @@ if [ -z "$NOTE" ]; then
 fi
 # Keep the patch backup in the extension folder current with every build.
 "$SCRIPT_DIR/export-warp-patches.sh" >/dev/null || echo "warning: patch export failed"
-B=target/wasm32-unknown-unknown/$PROFILE/bundle
+B="$WARP_TARGET_DIR/wasm32-unknown-unknown/$PROFILE/bundle"
 # Arguments go through argv, so quotes in the note can't break the AppleScript.
 notify() {
   osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "Warp panel build" subtitle (item 2 of argv)' -e 'end run' "$1" "$NOTE" >/dev/null 2>&1

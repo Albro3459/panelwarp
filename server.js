@@ -7,7 +7,8 @@
 //     is Warp's pane uuid, see "Adoption" below)
 //   - binary frames carry raw PTY bytes in both directions
 //   - text frames from the client are JSON resize events: {width, height, width_px, height_px}
-//     where width/height are columns/rows
+//     where width/height are columns/rows, or {"close": true} when the pane was closed for good
+//     (the shell is ended)
 //   - text frames from the server are JSON control messages: {"session": id}, {"exited": code},
 //     "password_prompt" (see watchPasswordPrompts), and {"adopt": ...} / "adopted" (below)
 // Adoption: shells outlive the page (daemon.js keeps this server running across VS Code window
@@ -486,7 +487,14 @@ async function startServer({
         return;
       }
       try {
-        const { width, height } = JSON.parse(data.toString());
+        const { width, height, close } = JSON.parse(data.toString());
+        if (close === true) {
+          // The pane was closed for good (after Warp's undo-close window): end the shell now
+          // instead of keeping it for a reattach.
+          log(`session ${session.term.pid} closed by the page`);
+          session.term.kill();
+          return;
+        }
         if (width > 0 && height > 0) session.term.resize(width, height);
       } catch (e) {
         log(`bad control message: ${e.message}`);

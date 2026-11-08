@@ -1,7 +1,7 @@
 From f72cb303a04f37aee743db62295fe7b652c10721 Mon Sep 17 00:00:00 2001
 From: Felix Krueckel <hi@felkru.com>
 Date: Tue, 13 Oct 2026 20:19:49 -0700
-Subject: [PATCH 61/61] New tabs start in the VS Code window's folder in
+Subject: [PATCH 61/64] New tabs start in the VS Code window's folder in
  embedded builds
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -4,7 +4,7 @@
 # Rebuild a Warp checkout from them with:
 #   git checkout $(cat warp-patches/UPSTREAM_COMMIT) && git am warp-patches/0*.patch
 set -euo pipefail
-WARP_SRC="${WARP_SRC:-$HOME/src/warp}"
+WARP_SRC="${WARP_SRC:-$HOME/Documents/programming/warp}"
 OUT="$(cd "$(dirname "$0")/.." && pwd)/warp-patches"
 base="$(cat "$OUT/UPSTREAM_COMMIT")"
 cd "$WARP_SRC"

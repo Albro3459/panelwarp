@@ -18,8 +18,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 TARGET="${1:-darwin-arm64}"
 PROFILE="${2:-release-wasm}"
-WARP_SRC="${WARP_SRC:-$HOME/src/warp}"
-SRC="$WARP_SRC/target/wasm32-unknown-unknown/$PROFILE/bundle"
+WARP_SRC="${WARP_SRC:-$HOME/Documents/programming/warp}"
+SRC="${WARP_TARGET_DIR:-$HOME/Library/Caches/warp-target}/wasm32-unknown-unknown/$PROFILE/bundle"
 PREBUILDS=node_modules/node-pty/prebuilds
 [ -d "$PREBUILDS/$TARGET" ] || { echo "no node-pty prebuild for $TARGET"; exit 2; }
 [ -f "$SRC/wasm/warp.js" ] || { echo "no Warp bundle at $SRC"; exit 2; }
@@ -38,7 +38,16 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE" "$STAGE.extension.js" "$STAGE.daemon.js"' EXIT
 
 # Extension files and node-pty (with only this platform's prebuild).
-rsync -a --exclude .git --exclude bundle --exclude node_modules --exclude '*.vsix' ./ "$STAGE/"
+rsync -a --exclude .git --exclude bundle --exclude node_modules --exclude notifier --exclude '*.vsix' \
+  ./ "$STAGE/"
+# The macOS notifier app (finished-agent notifications that open the conversation on click).
+case "$TARGET" in
+  darwin-*)
+    # Straight into the staging copy: package.sh runs for both darwin targets at once.
+    scripts/build-notifier.sh "$([ "$TARGET" = darwin-x64 ] && echo x86_64 || echo arm64)" \
+      "$STAGE/notifier/Panelwarp.app" >/dev/null
+    ;;
+esac
 mkdir -p "$STAGE/node_modules"
 rsync -a --exclude prebuilds node_modules/node-pty node_modules/node-addon-api "$STAGE/node_modules/"
 mkdir -p "$STAGE/node_modules/node-pty/prebuilds"

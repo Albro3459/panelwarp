@@ -1,7 +1,7 @@
 From 6d3133df46b7f79e29dad8abaeb7b2fc07ff83ea Mon Sep 17 00:00:00 2001
 From: Felix Krueckel <hi@felkru.com>
 Date: Sun, 11 Oct 2026 21:41:22 -0700
-Subject: [PATCH 58/61] Clear stale "in progress" on idle CLI agents
+Subject: [PATCH 58/64] Clear stale "in progress" on idle CLI agents
 
 A CLI agent session is registered as InProgress when its command is
 detected and only left that state on Stop/StopFailure or Ctrl-C. A freshly

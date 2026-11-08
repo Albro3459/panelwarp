@@ -1,0 +1,201 @@
+From 99af99046c7a385bfbdc75c1472ba7943e1a5645 Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Mon, 19 Oct 2026 00:38:18 -0700
+Subject: [PATCH 63/64] History works in every tab when another tab's history
+ read hangs
+
+Up-arrow history read the shell's history file once per user/host/shell, through the first
+session that bootstrapped; every other session waited on that read. In embedded builds the read
+is an in-band `cat` in that session's shell, and it can hang for good: a shell taken over after a
+page reload while it runs a command (`tail -f`, Claude Code) drops Warp's writes, so the `cat`
+never runs. Until it does, every tab's history menu showed "No results", even for commands just
+run there. Now each session that bootstraps while the read is in progress reads the file too,
+and the first read to finish is used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/terminal/history.rs       | 93 ++++++++++++++++++++-----------
+ app/src/terminal/history_tests.rs | 58 +++++++++++++++++++
+ 2 files changed, 119 insertions(+), 32 deletions(-)
+
+diff --git a/app/src/terminal/history.rs b/app/src/terminal/history.rs
+index faf1dd9..9e777c8 100644
+--- a/app/src/terminal/history.rs
++++ b/app/src/terminal/history.rs
+@@ -540,38 +540,7 @@ impl History {
+                         session_ids,
+                     },
+                 );
+-                let host_clone = host.clone();
+-                ctx.spawn(
+-                    read_history_file_future,
+-                    move |me, history_file_commands, ctx| {
+-                        // `session_commands_to_append` are commands executed by the user while the
+-                        // history file was being loaded.
+-                        let (session_commands_to_append, session_ids) = match me
+-                            .read_history_file_state
+-                            .insert(host_clone, ReadHistoryFileState::Done)
+-                        {
+-                            Some(ReadHistoryFileState::InProgress {
+-                                session_commands_to_append,
+-                                session_ids,
+-                            }) => (Some(session_commands_to_append), session_ids),
+-                            _ => {
+-                                // This branch should be unreachable, but don't panic!
+-                                log::warn!("Marking ReadHistoryFileState::Done for session when \
+-                                           its previous state was not ReadHistoryFileState::InProgress.");
+-                                let mut session_ids = HashSet::new();
+-                                session_ids.insert(session_id);
+-                                (None, session_ids)
+-                            }
+-                        };
+-                        me.load_history_file_commands(
+-                            history_file_commands,
+-                            session_commands_to_append,
+-                            session_ids,
+-                            host,
+-                            ctx,
+-                        );
+-                    },
+-                );
++                self.spawn_history_file_read(host, session_id, read_history_file_future, ctx);
+             }
+             Some(ReadHistoryFileState::Done) => {
+                 let Some(history_file_commands) = self.history_file_commands.get(&host) else {
+@@ -598,10 +567,70 @@ impl History {
+             }
+             Some(ReadHistoryFileState::InProgress { session_ids, .. }) => {
+                 session_ids.insert(session_id);
++                // The read in progress belongs to another session, and may never finish: e.g.
++                // an in-band read whose shell is busy with a program (a shell taken over after a
++                // page reload while it ran `tail -f` drops it), or a pane that went away. Until
++                // it does, no session of this host can show history, not even its own commands.
++                // So this session reads the file too; the first read to finish is used.
++                self.spawn_history_file_read(host, session_id, read_history_file_future, ctx);
+             }
+         }
+     }
+ 
++    /// Reads the history file for `host` in the background (through `session_id`'s session) and
++    /// loads it for every session waiting on it, unless another session's read finished first.
++    fn spawn_history_file_read<F>(
++        &mut self,
++        host: ShellHost,
++        session_id: SessionId,
++        read_history_file_future: F,
++        ctx: &mut ModelContext<Self>,
++    ) where
++        F: 'static + Future<Output = Vec<String>> + Send,
++    {
++        let host_clone = host.clone();
++        ctx.spawn(
++            read_history_file_future,
++            move |me, history_file_commands, ctx| {
++                if matches!(
++                    me.read_history_file_state.get(&host_clone),
++                    Some(ReadHistoryFileState::Done)
++                ) {
++                    // Another session's read finished first and initialized this session too.
++                    return;
++                }
++                // `session_commands_to_append` are commands executed by the user while the
++                // history file was being loaded.
++                let (session_commands_to_append, session_ids) = match me
++                    .read_history_file_state
++                    .insert(host_clone, ReadHistoryFileState::Done)
++                {
++                    Some(ReadHistoryFileState::InProgress {
++                        session_commands_to_append,
++                        session_ids,
++                    }) => (Some(session_commands_to_append), session_ids),
++                    _ => {
++                        // This branch should be unreachable, but don't panic!
++                        log::warn!(
++                            "Marking ReadHistoryFileState::Done for session when \
++                                   its previous state was not ReadHistoryFileState::InProgress."
++                        );
++                        let mut session_ids = HashSet::new();
++                        session_ids.insert(session_id);
++                        (None, session_ids)
++                    }
++                };
++                me.load_history_file_commands(
++                    history_file_commands,
++                    session_commands_to_append,
++                    session_ids,
++                    host,
++                    ctx,
++                );
++            },
++        );
++    }
++
+     /// Parses the given `history_file_commands` into `HistoryEntry`'s and sets the
+     /// `history_file_commands` entry for the session with the given ID.
+     ///
+diff --git a/app/src/terminal/history_tests.rs b/app/src/terminal/history_tests.rs
+index 3436e0f..df6a4ad 100644
+--- a/app/src/terminal/history_tests.rs
++++ b/app/src/terminal/history_tests.rs
+@@ -1020,3 +1020,61 @@ fn is_appendable_vs_is_queryable() {
+         });
+     });
+ }
++
++#[test]
++fn stuck_history_file_read_does_not_block_other_sessions() {
++    App::test((), |mut app| async move {
++        let session_a = Arc::new(Session::new(
++            SessionInfo::new_for_test()
++                .with_id(0)
++                .with_shell_type(ShellType::Zsh),
++            Arc::new(TestCommandExecutor::default()),
++        ));
++        let session_b = Arc::new(Session::new(
++            SessionInfo::new_for_test()
++                .with_id(1)
++                .with_shell_type(ShellType::Zsh),
++            Arc::new(TestCommandExecutor::default()),
++        ));
++        let (session_a_id, session_b_id) = (session_a.id(), session_b.id());
++        let (tx, rx) = async_channel::bounded::<()>(1);
++
++        let mut history_handle = app.add_model(|_| History::default());
++        history_handle.update(&mut app, move |history, ctx| {
++            // Session A's read hangs until `tx` sends.
++            history.init_session_with(
++                session_a,
++                async move {
++                    pin!(rx).next().await;
++                    vec!["late".to_string()]
++                },
++                ctx,
++            );
++            history.init_session_with(session_b, async { vec!["z1".to_string()] }, ctx);
++        });
++        History::initialized_sessions(
++            &mut history_handle,
++            &mut app,
++            vec![session_a_id, session_b_id],
++        )
++        .await;
++
++        history_handle.update(&mut app, |history, _| {
++            history.append_commands(
++                session_b_id,
++                vec![HistoryEntry::with_session_id(session_b_id, "z2")],
++            );
++        });
++        history_handle.read(&app, |history, _| {
++            assert_eq!(history.len(session_a_id), 1);
++            assert_eq!(history.len(session_b_id), 2);
++        });
++
++        // Session A's read finishing later doesn't replace the loaded history.
++        tx.send(()).await.unwrap();
++        history_handle.update(&mut app, |_, _| {});
++        history_handle.read(&app, |history, _| {
++            assert_eq!(history.len(session_b_id), 2);
++        });
++    });
++}
