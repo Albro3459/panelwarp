@@ -264,22 +264,40 @@ class SettingsFile {
 
   /**
    * Reads both files into this window's entries (on top of `base` when given), and the changed
-   * ones into the mirror; returns the changes (null for removed). Private routing only turns off
-   * once that's allowed on this machine: by Warp's settings page, which asks, or by a sync with
-   * `confirm` set, which asks here. Until then it stays on. Throws if a file can't be read or
-   * parsed.
+   * ones into the mirror; returns the changes (null for removed) and file errors. Private routing
+   * only turns off once that's allowed on this machine: by Warp's settings page, which asks, or by
+   * a sync with `confirm` set, which asks here. Until then it stays on. A file that can't be read or
+   * parsed keeps its last entries while the other file still applies.
    */
   async sync(confirm, base) {
     // Until migrate() succeeds the file may be stale, and the mirror holds the settings
     if (!fs.existsSync(this.migratedFile)) {
       this.state = this.globalState.get(this.storageKey, {});
-      return {};
+      return { changes: {}, errors: [] };
     }
-    const fromFiles = () =>
-      withKeybindings(applyToml(read(this.file), base ?? this.state), read(this.keybindingsFile));
+    let errors;
+    let settingsReadable;
+    const fromFiles = () => {
+      errors = [];
+      settingsReadable = true;
+      let next;
+      try {
+        next = applyToml(read(this.file), base ?? this.state);
+      } catch (error) {
+        settingsReadable = false;
+        errors.push(`settings.toml: ${error.message}`);
+        next = { ...this.state };
+      }
+      try {
+        next = withKeybindings(next, read(this.keybindingsFile));
+      } catch (error) {
+        errors.push(`keybindings.yaml: ${error.message}`);
+      }
+      return next;
+    };
     const unconfirmed = (entries) => !isPrivateRouting(entries) && !fs.existsSync(this.routingAllowedFile);
     let next = fromFiles();
-    if (confirm && unconfirmed(next)) {
+    if (confirm && settingsReadable && unconfirmed(next)) {
       // One dialog for every sync that asks at once
       this.confirming ??= confirmPublicRouting().finally(() => {
         this.confirming = null;
@@ -288,9 +306,9 @@ class SettingsFile {
       // The files and this window's entries may have changed while the dialog was open
       next = fromFiles();
     }
-    if (isPrivateRouting(next)) this.setRoutingOffAllowed(false);
-    this.routingPending = !confirm && unconfirmed(next);
-    if (unconfirmed(next)) {
+    if (settingsReadable && isPrivateRouting(next)) this.setRoutingOffAllowed(false);
+    this.routingPending = settingsReadable && !confirm && unconfirmed(next);
+    if (settingsReadable && unconfirmed(next)) {
       next = { ...next, HostAiPrivateRouting: encode(true) };
       if (confirm) {
         fs.writeFileSync(this.file, updateToml(read(this.file), { HostAiPrivateRouting: encode(true) }));
@@ -300,7 +318,7 @@ class SettingsFile {
     const changes = changedEntries(this.state, next);
     this.state = next;
     if (Object.keys(changes).length) await this.updateMirror(changes);
-    return changes;
+    return { changes, errors };
   }
 
   /** Records whether private routing may be off on this machine. */
@@ -326,7 +344,8 @@ class SettingsFile {
    */
   async load() {
     try {
-      await this.sync(false, this.globalState.get(this.storageKey, {}));
+      const { errors } = await this.sync(false, this.globalState.get(this.storageKey, {}));
+      if (errors.length) vscode.window.showErrorMessage(`Warp couldn't read its settings: ${errors.join('; ')}`);
     } catch (error) {
       vscode.window.showErrorMessage(`Warp couldn't read its settings: ${error.message}`);
     }
@@ -352,7 +371,9 @@ class SettingsFile {
         const routingOn = 'HostAiPrivateRouting' in changes ? isPrivateRouting(next) : null;
         if (routingOn === true) this.setRoutingOffAllowed(false);
         // Keybindings first, so a syntax error in settings.toml can't hold them back
-        if (typeof changes[KEYBINDINGS_KEY] === 'string') {
+        if (changes[KEYBINDINGS_KEY] === null) {
+          fs.writeFileSync(this.keybindingsFile, '');
+        } else if (typeof changes[KEYBINDINGS_KEY] === 'string') {
           fs.writeFileSync(this.keybindingsFile, JSON.parse(changes[KEYBINDINGS_KEY]));
         }
         if (Object.keys(changes).some((key) => key in SETTINGS_MAP)) {
@@ -390,13 +411,17 @@ class SettingsFile {
   async applySaved() {
     let changes;
     try {
-      changes = await this.sync(true);
+      const result = await this.sync(true);
+      changes = result.changes;
+      if (result.errors.length) {
+        vscode.window.showErrorMessage(`Warp couldn't apply the file: ${result.errors.join('; ')}`);
+      }
     } catch (error) {
       vscode.window.showErrorMessage(`Warp couldn't apply the file: ${error.message}`);
       return;
     }
     this.log.appendLine('applied a saved settings file');
-    if (this.onChanged(changes)) return;
+    if (this.notify(changes) || !Object.keys(changes).length) return;
     const choice = await vscode.window.showInformationMessage(
       'Warp settings saved. Reload the Warp panel to apply them? This restarts its shell sessions.',
       'Reload now',
@@ -410,11 +435,19 @@ class SettingsFile {
     if (this.routingPending) this.apply(true);
   }
 
+  /** A newer Warp save can finish while sync waits for the mirror; only send current values. */
+  notify(changes) {
+    const current = {};
+    for (const key of Object.keys(changes)) current[key] = this.state[key] ?? null;
+    return this.onChanged(current);
+  }
+
   /** Hands the running panel what changed in the files. */
   async apply(confirm) {
     try {
-      const changes = await this.sync(confirm);
-      if (Object.keys(changes).length) this.onChanged(changes);
+      const { changes, errors } = await this.sync(confirm);
+      for (const error of errors) this.log.appendLine(`settings files: ${error}`);
+      if (Object.keys(changes).length) this.notify(changes);
     } catch (error) {
       // E.g. a syntax error in an edit in progress; saving it in VS Code shows the error
       this.log.appendLine(`settings files: ${error.message}`);
