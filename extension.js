@@ -15,7 +15,7 @@ const { SettingsFile } = require('./settingsFile');
 const { WarpAi } = require('./ai');
 const { PanelSettings, confirm } = require('./panelSettings');
 const { CommandHistory } = require('./history');
-const { SessionStore } = require('./sessionStore');
+const { SessionStore, workspaceKey } = require('./sessionStore');
 const filePaths = require('./filePaths');
 const { readWorkflowFiles } = require('./workflows');
 const { AgentConversations, openPendingClaudeConversation } = require('./agents');
@@ -76,14 +76,6 @@ function startupShell() {
     if (found) return found;
   }
   return process.env.SHELL || '/bin/zsh';
-}
-
-/**
- * The key this window's tabs are saved under, so a window only restores its own folder's tabs.
- * Null without a folder: those windows always start with one tab in the home folder.
- */
-function workspaceKey() {
-  return (vscode.workspace.workspaceFile ?? vscode.workspace.workspaceFolders?.[0]?.uri)?.toString() ?? null;
 }
 
 const STORAGE_KEY = 'warp.localStorage';
@@ -401,18 +393,14 @@ class WarpViewProvider {
       case 'warp-reveal-file':
         await filePaths.revealFile(vscode, msg.path);
         break;
-      case 'warp-save-session': {
-        const workspace = workspaceKey();
-        if (!workspace) break;
+      case 'warp-save-session':
         try {
-          this.sessions?.saveSession(workspace, msg.json);
+          this.sessions?.saveSession(this.workspace, msg.json);
         } catch (error) {
           this.log.appendLine(`save tabs: ${error.message}`);
         }
         break;
-      }
       case 'warp-save-block':
-        if (!workspaceKey()) break;
         try {
           this.sessions?.saveBlock(msg.paneUuid, msg.json);
         } catch (error) {
@@ -485,10 +473,8 @@ class WarpViewProvider {
 
   /** This workspace's tabs to restore (sessionStore.js), as JSON; null if none or unreadable. */
   loadSession() {
-    const workspace = workspaceKey();
-    if (!workspace) return null;
     try {
-      return this.sessions?.load(workspace) ?? null;
+      return this.sessions?.load(this.workspace) ?? null;
     } catch (error) {
       this.log.appendLine(`load tabs: ${error.message}`);
       return null;
@@ -696,6 +682,7 @@ function activate(context) {
     log.appendLine(`command history unavailable: ${error.message}`);
   }
   try {
+    provider.workspace = workspaceKey(vscode.workspace, context.workspaceState);
     provider.sessions = new SessionStore(context.globalStorageUri.fsPath);
   } catch (error) {
     log.appendLine(`tab restoration unavailable: ${error.message}`);
