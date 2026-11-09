@@ -202,6 +202,7 @@ class SettingsFile {
     // since the mirror is shared with windows on other machines (remote windows) and changes
     // between them in any order.
     this.state = this.globalState.get(storageKey, {});
+    this.pendingChanges = new Set();
     // Set while the files turn private routing off and nothing has asked about it yet
     this.routingPending = false;
     const dir = context.globalStorageUri.fsPath;
@@ -317,6 +318,7 @@ class SettingsFile {
     }
     const changes = changedEntries(this.state, next);
     this.state = next;
+    for (const key of Object.keys(changes)) this.pendingChanges.add(key);
     if (Object.keys(changes).length) await this.updateMirror(changes);
     return { changes, errors };
   }
@@ -349,6 +351,8 @@ class SettingsFile {
     } catch (error) {
       vscode.window.showErrorMessage(`Warp couldn't read its settings: ${error.message}`);
     }
+    // The returned snapshot applies these entries when Warp starts
+    this.pendingChanges.clear();
     return this.state;
   }
 
@@ -358,6 +362,7 @@ class SettingsFile {
     for (const [key, value] of Object.entries(changes)) {
       if (value === null) delete next[key];
       else next[key] = value;
+      this.pendingChanges.delete(key);
     }
     this.state = next;
     // The files before the mirror's await, so a watcher sync in between can't read the old file
@@ -409,10 +414,8 @@ class SettingsFile {
 
   /** A settings or keybindings file saved in a VS Code editor; the watcher may have synced it first. */
   async applySaved() {
-    let changes;
     try {
       const result = await this.sync(true);
-      changes = result.changes;
       if (result.errors.length) {
         vscode.window.showErrorMessage(`Warp couldn't apply the file: ${result.errors.join('; ')}`);
       }
@@ -421,7 +424,7 @@ class SettingsFile {
       return;
     }
     this.log.appendLine('applied a saved settings file');
-    if (this.notify(changes) || !Object.keys(changes).length) return;
+    if (this.notify() || !this.pendingChanges.size) return;
     const choice = await vscode.window.showInformationMessage(
       'Warp settings saved. Reload the Warp panel to apply them? This restarts its shell sessions.',
       'Reload now',
@@ -436,18 +439,20 @@ class SettingsFile {
   }
 
   /** A newer Warp save can finish while sync waits for the mirror; only send current values. */
-  notify(changes) {
+  notify() {
     const current = {};
-    for (const key of Object.keys(changes)) current[key] = this.state[key] ?? null;
-    return this.onChanged(current);
+    for (const key of this.pendingChanges) current[key] = this.state[key] ?? null;
+    if (!this.onChanged(current)) return false;
+    this.pendingChanges.clear();
+    return true;
   }
 
   /** Hands the running panel what changed in the files. */
   async apply(confirm) {
     try {
-      const { changes, errors } = await this.sync(confirm);
+      const { errors } = await this.sync(confirm);
       for (const error of errors) this.log.appendLine(`settings files: ${error}`);
-      if (Object.keys(changes).length) this.notify(changes);
+      if (this.pendingChanges.size) this.notify();
     } catch (error) {
       // E.g. a syntax error in an edit in progress; saving it in VS Code shows the error
       this.log.appendLine(`settings files: ${error.message}`);

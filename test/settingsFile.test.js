@@ -43,6 +43,7 @@ async function fixture(t, { mirror = {}, dir, live = true, watch = false, reload
   const subscriptions = [];
   const errors = [];
   const confirmations = [];
+  const reloadPrompts = [];
   const waiting = [];
   const page = { ...mirror };
   let entries = { ...mirror };
@@ -65,8 +66,11 @@ async function fixture(t, { mirror = {}, dir, live = true, watch = false, reload
     workspace: { onDidSaveTextDocument: () => ({ dispose() {} }) },
     window: {
       showErrorMessage: (message) => { errors.push(message); },
-      showInformationMessage: async (_message, ...choices) =>
-        reload && choices.includes('Reload now') ? 'Reload now' : undefined,
+      showInformationMessage: async (message, ...choices) => {
+        if (!choices.includes('Reload now')) return undefined;
+        reloadPrompts.push(message);
+        return reload ? 'Reload now' : undefined;
+      },
       showWarningMessage: async (...args) => {
         confirmations.push(args);
         return allowRouting ? 'Allow' : undefined;
@@ -79,14 +83,20 @@ async function fixture(t, { mirror = {}, dir, live = true, watch = false, reload
   }, {
     storageKey: 'warp.localStorage',
     onChanged(changes) {
+      if (!live) return false;
       for (const [key, value] of Object.entries(changes)) {
         if (value === null) delete page[key];
         else page[key] = value;
       }
       waiting.shift()?.(changes);
-      return live;
+      return true;
     },
-    onApplied: async () => { reloads += 1; },
+    onApplied: async () => {
+      reloads += 1;
+      const snapshot = await settings.load();
+      for (const key of Object.keys(page)) delete page[key];
+      Object.assign(page, snapshot);
+    },
     log: { appendLine() {} },
   });
   if (!watch) subscriptions.at(-1).dispose();
@@ -97,10 +107,11 @@ async function fixture(t, { mirror = {}, dir, live = true, watch = false, reload
   await settings.migrate();
   await settings.load();
   return {
-    settings, page, errors, confirmations,
+    settings, page, errors, confirmations, reloadPrompts,
     get reloads() { return reloads; },
     get mirror() { return entries; },
     allowRouting: () => { allowRouting = true; },
+    chooseReload: () => { reload = true; },
     nextChange: () => new Promise((resolve) => waiting.push(resolve)),
     pauseNextUpdate() {
       const started = deferred();
@@ -174,6 +185,56 @@ test('older Warp builds can reload valid keybindings despite invalid TOML', asyn
   assert.equal(f.reloads, 1);
   assert.equal(f.settings.state.CustomKeybindings, JSON.stringify(newBindings));
   assert.match(f.errors.join('\n'), /settings\.toml/);
+});
+
+test('a watcher-first update still offers reload to an older Warp build', async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' }, live: false, reload: true });
+  fs.writeFileSync(f.settings.file, '[appearance.text]\nfont_size = 14\n');
+  fs.writeFileSync(f.settings.keybindingsFile, newBindings);
+  await f.settings.apply(false);
+  assert.equal(f.page.FontSize, '"13"');
+  assert.equal(f.page.CustomKeybindings, undefined);
+  await f.settings.applySaved();
+  assert.equal(f.reloads, 1);
+  assert.equal(f.page.FontSize, '"14"');
+  assert.equal(f.page.CustomKeybindings, JSON.stringify(newBindings));
+  await f.settings.applySaved();
+  assert.equal(f.reloadPrompts.length, 1);
+});
+
+test('unapplied changes survive declining the reload prompt', async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' }, live: false });
+  fs.writeFileSync(f.settings.file, '[appearance.text]\nfont_size = 14\n');
+  await f.settings.apply(false);
+  await f.settings.applySaved();
+  assert.equal(f.page.FontSize, '"13"');
+  assert.equal(f.reloadPrompts.length, 1);
+  f.chooseReload();
+  await f.settings.applySaved();
+  assert.equal(f.reloads, 1);
+  assert.equal(f.page.FontSize, '"14"');
+});
+
+test('an editor save offers reload while a watcher is waiting for storage', async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' }, live: false, reload: true });
+  fs.writeFileSync(f.settings.file, '[appearance.text]\nfont_size = 14\n');
+  const update = f.pauseNextUpdate();
+  const applying = f.settings.apply(false);
+  await update.started;
+  try {
+    await f.settings.applySaved();
+    assert.equal(f.reloads, 1);
+    assert.equal(f.page.FontSize, '"14"');
+  } finally {
+    update.release();
+    await applying;
+  }
+});
+
+test('an unchanged save does not offer reload to an older Warp build', async (t) => {
+  const f = await fixture(t, { live: false, reload: true });
+  await f.settings.applySaved();
+  assert.equal(f.reloadPrompts.length, 0);
 });
 
 test('removing keybindings in Warp stays removed after startup', async (t) => {
