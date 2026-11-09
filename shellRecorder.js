@@ -1,8 +1,11 @@
 // What a reloaded page needs to take over a running shell (see `adopt` in server.js). Warp builds
 // its blocks from hooks its bootstrap makes the shell print, so a new page can't start from the
 // shell's current screen: it gets the shell's output from the start up to the end of its
-// bootstrap (the session's identity: shell, aliases, functions), then everything since the latest
-// prompt (the running command, or the idle prompt). Earlier blocks come back from the tab store.
+// bootstrap (the session's identity: shell, aliases, functions), then the tab title and everything
+// since the latest prompt (the running command, or the idle prompt). Earlier blocks come back from
+// the tab store. Warp's own commands at the prompt (completions, history) are left out: only the
+// page that ran them can follow them, and a new page that got them showed no prompt until the
+// user's next command.
 //
 // Hooks are `ESC P $ d <hex JSON> ESC \` (DCS) or `ESC ] 9278 ; d ; <hex JSON> BEL` (OSC, used by
 // the SSH wrapper), with JSON like {"hook": "Precmd", "value": {"session_id": 123, ...}}.
@@ -24,6 +27,8 @@ const MAX_BOOTSTRAP_BYTES = 8 * 1024 * 1024;
  * mode switches) and the newest output, dropping the middle past this. */
 const TAIL_HEAD_BYTES = 256 * 1024;
 const MAX_TAIL_BYTES = 4 * 1024 * 1024;
+/** `ESC ] 0 ;` or `ESC ] 2 ;` <title> BEL or ST */
+const TITLE = /\x1b\][02];[^\x07\x1b]*(?:\x07|\x1b\\)/g;
 
 class ShellRecorder {
   constructor() {
@@ -39,8 +44,14 @@ class ShellRecorder {
     this.tailHeadBytes = 0;
     this.tailRest = [];
     this.tailRestBytes = 0;
-    /** Whether the shell is running a command, rather than waiting at its prompt. */
+    /** Whether the shell is running the user's command, rather than waiting at its prompt. */
     this.running = false;
+    /** The latest tab title the shell set, which comes before the prompt's hooks. */
+    this.title = null;
+    /** Output at the prompt since Warp last asked for the input buffer, kept only in case the
+     * user's command follows (its echo); null until the prompt is up. */
+    this.idleOutput = null;
+    this.idleOutputBytes = 0;
   }
 
   /**
@@ -95,10 +106,42 @@ class ShellRecorder {
       if (ownHook && hook.name === 'Bootstrapped') this.bootstrapped = true;
       return;
     }
+    if (!hook && bytes.includes('\x1b]')) {
+      const titles = bytes.toString('latin1').match(TITLE);
+      if (titles) this.title = Buffer.from(titles[titles.length - 1], 'latin1');
+    }
     // Warp's own (in-band) commands end with a Precmd too, without the prompt's details.
-    if (ownHook && hook.name === 'Precmd' && !hook.afterInBand && attached) this.resetTail();
-    if (ownHook && hook.name === 'Preexec') this.running = true;
+    const userPrecmd = ownHook && hook.name === 'Precmd' && !hook.afterInBand;
+    const userPreexec = ownHook && hook.name === 'Preexec' && !hook.inBand;
+    const inputBuffer = ownHook && hook.name === 'InputBuffer';
+    if (this.idleOutput) {
+      // Warp asks for the input buffer whenever its input is up again, so what's left after the
+      // latest ask is the echo of what it types next
+      if (inputBuffer) {
+        this.idleOutput = [];
+        this.idleOutputBytes = 0;
+        return;
+      }
+      if (!userPrecmd && !userPreexec) {
+        this.idleOutput.push(Buffer.from(bytes));
+        this.idleOutputBytes += bytes.length;
+        while (this.idleOutputBytes > MAX_TAIL_BYTES && this.idleOutput.length > 1) {
+          this.idleOutputBytes -= this.idleOutput.shift().length;
+        }
+        return;
+      }
+      // The user's command, or Enter on an empty line
+      for (const chunk of this.idleOutput) this.pushTail(chunk);
+      this.idleOutput = null;
+    }
+    if (userPrecmd && attached) this.resetTail();
+    if (userPreexec) this.running = true;
     if (ownHook && (hook.name === 'CommandFinished' || hook.name === 'Precmd')) this.running = false;
+    if (inputBuffer && !this.running) {
+      this.idleOutput = [];
+      this.idleOutputBytes = 0;
+      return;
+    }
     this.pushTail(Buffer.from(bytes));
   }
 
@@ -125,7 +168,7 @@ class ShellRecorder {
   /** The output to hand a new page, or null if this shell can't be taken over. */
   replay() {
     if (!this.adoptable || !this.bootstrapped) return null;
-    return [...this.bootstrap, ...this.tailHead, ...this.tailRest];
+    return [...this.bootstrap, ...(this.title ? [this.title] : []), ...this.tailHead, ...this.tailRest];
   }
 }
 
@@ -149,8 +192,8 @@ function partialMarkerStart(buf, from) {
   return buf.length;
 }
 
-/** The hook's name, session id (kept as a string: it's a u64) and whether it ends an in-band
- * command. */
+/** The hook's name, session id (kept as a string: it's a u64) and whether it starts or ends an
+ * in-band command (fish's start with a space). */
 function parseHook(hex) {
   const json = Buffer.from(hex.toString('latin1'), 'hex').toString('utf8');
   const name = /"hook"\s*:\s*"(\w+)"/.exec(json)?.[1];
@@ -159,6 +202,7 @@ function parseHook(hex) {
     name,
     sessionId: /"session_id"\s*:\s*(\d+)/.exec(json)?.[1] ?? null,
     afterInBand: /"is_after_in_band_command"\s*:\s*true/.test(json),
+    inBand: /"command"\s*:\s*" ?warp_run_generator_command /.test(json),
   };
 }
 
