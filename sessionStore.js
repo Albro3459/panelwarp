@@ -4,6 +4,7 @@
 // windows). Warp sends the layout whenever it changes and each block when it finishes
 // (`host_session` in app/src/platform/wasm.rs), and gets the latest of both at startup.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
@@ -14,6 +15,7 @@ const MAX_BLOCKS_PER_PANE = 100;
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** A layout or block bigger than this isn't stored (a block's output is already truncated). */
 const MAX_JSON_LENGTH = 4 * 1024 * 1024;
+const EMPTY_WINDOW_KEY = 'warp.emptyWindowId';
 
 class SessionStore {
   /** @param {string} storageDir the extension's globalStorageUri.fsPath */
@@ -23,7 +25,7 @@ class SessionStore {
     // Every VS Code window has its own connection to this file.
     this.db.exec(`
       PRAGMA busy_timeout = 2000;
-      -- One layout shared by every window opened another folder's tabs in a new window
+      -- The single layout every window shared made a new window open another folder's tabs
       DROP TABLE IF EXISTS panel_session;
       CREATE TABLE IF NOT EXISTS panel_workspace_session (
         workspace TEXT PRIMARY KEY NOT NULL,
@@ -59,12 +61,16 @@ class SessionStore {
 
   /**
    * The workspace's latest layout and its panes' blocks (oldest first), as JSON for Warp; null if none.
-   * @param {string} workspace the VS Code workspace's URI
+   * @param {string} workspace see workspaceKey
    */
   load(workspace) {
-    const cutoff = Date.now() - MAX_AGE_MS;
-    this.dropOldSessions.run(cutoff);
-    this.dropOldPanes.run(cutoff);
+    // A busy database can skip cleanup but must not stop the restore, or Warp's next save
+    // replaces the layout with a fresh tab
+    try {
+      const cutoff = Date.now() - MAX_AGE_MS;
+      this.dropOldSessions.run(cutoff);
+      this.dropOldPanes.run(cutoff);
+    } catch {}
     const row = this.selectSession.get(workspace);
     if (!row) return null;
     let session;
@@ -82,7 +88,7 @@ class SessionStore {
   }
 
   /**
-   * @param {string} workspace the VS Code workspace's URI
+   * @param {string} workspace see workspaceKey
    * @param {string} json the layout, replacing the workspace's previous one (the latest window wins)
    */
   saveSession(workspace, json) {
@@ -117,4 +123,21 @@ function paneUuids(session) {
   return uuids;
 }
 
-module.exports = { SessionStore, paneUuids };
+/**
+ * The key a window's tabs are saved under, so each window only restores its own: the
+ * .code-workspace file, else the first folder, else an id kept in an empty window's workspace
+ * state, which survives its reloads (a new empty window starts fresh in the home folder).
+ * @param {typeof import('vscode').workspace} workspace
+ * @param {import('vscode').Memento} workspaceState
+ */
+function workspaceKey(workspace, workspaceState) {
+  const uri = workspace.workspaceFile ?? workspace.workspaceFolders?.[0]?.uri;
+  if (uri) return uri.toString();
+  const savedId = workspaceState.get(EMPTY_WINDOW_KEY);
+  if (savedId) return `empty-window:${savedId}`;
+  const id = crypto.randomUUID();
+  workspaceState.update(EMPTY_WINDOW_KEY, id);
+  return `empty-window:${id}`;
+}
+
+module.exports = { SessionStore, paneUuids, workspaceKey };
