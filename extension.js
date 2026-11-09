@@ -78,6 +78,14 @@ function startupShell() {
   return process.env.SHELL || '/bin/zsh';
 }
 
+/**
+ * The key this window's tabs are saved under, so a window only restores its own folder's tabs.
+ * Null without a folder: those windows always start with one tab in the home folder.
+ */
+function workspaceKey() {
+  return (vscode.workspace.workspaceFile ?? vscode.workspace.workspaceFolders?.[0]?.uri)?.toString() ?? null;
+}
+
 const STORAGE_KEY = 'warp.localStorage';
 // Opt-in (`host.history_sync`): the newest commands, synced across machines by VS Code Settings
 // Sync and merged into each machine's history at startup.
@@ -396,14 +404,18 @@ class WarpViewProvider {
       case 'warp-reveal-file':
         await filePaths.revealFile(vscode, msg.path);
         break;
-      case 'warp-save-session':
+      case 'warp-save-session': {
+        const workspace = workspaceKey();
+        if (!workspace) break;
         try {
-          this.sessions?.saveSession(msg.json);
+          this.sessions?.saveSession(workspace, msg.json);
         } catch (error) {
           this.log.appendLine(`save tabs: ${error.message}`);
         }
         break;
+      }
       case 'warp-save-block':
+        if (!workspaceKey()) break;
         try {
           this.sessions?.saveBlock(msg.paneUuid, msg.json);
         } catch (error) {
@@ -454,10 +466,12 @@ class WarpViewProvider {
     this.view?.webview.postMessage(msg);
   }
 
-  /** The tabs to restore (sessionStore.js), as JSON; null if none or unreadable. */
+  /** This workspace's tabs to restore (sessionStore.js), as JSON; null if none or unreadable. */
   loadSession() {
+    const workspace = workspaceKey();
+    if (!workspace) return null;
     try {
-      return this.sessions?.load() ?? null;
+      return this.sessions?.load(workspace) ?? null;
     } catch (error) {
       this.log.appendLine(`load tabs: ${error.message}`);
       return null;
