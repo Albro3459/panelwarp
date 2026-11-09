@@ -52,6 +52,8 @@ class ShellRecorder {
      * user's command follows (its echo); null until the prompt is up. */
     this.idleOutput = null;
     this.idleOutputBytes = 0;
+    /** Whether Warp's own commands printed hooks since it last asked for the input buffer. */
+    this.idleHooks = false;
   }
 
   /**
@@ -113,16 +115,23 @@ class ShellRecorder {
     // Warp's own (in-band) commands end with a Precmd too, without the prompt's details.
     const userPrecmd = ownHook && hook.name === 'Precmd' && !hook.afterInBand;
     const userPreexec = ownHook && hook.name === 'Preexec' && !hook.inBand;
-    const inputBuffer = ownHook && hook.name === 'InputBuffer';
+    // Warp asks for the input buffer whenever its input is up again, so what follows at the
+    // prompt is Warp's own commands, or the echo of the user's
+    if (ownHook && hook.name === 'InputBuffer' && !this.running) {
+      this.idleOutput = [];
+      this.idleOutputBytes = 0;
+      this.idleHooks = false;
+      return;
+    }
     if (this.idleOutput) {
-      // Warp asks for the input buffer whenever its input is up again, so what's left after the
-      // latest ask is the echo of what it types next
-      if (inputBuffer) {
-        this.idleOutput = [];
-        this.idleOutputBytes = 0;
-        return;
-      }
       if (!userPrecmd && !userPreexec) {
+        if (ownHook) this.idleHooks = true;
+        // Warp only runs its commands while a page shows the shell, so output without one (a
+        // background job's) is kept for the next page, unless a command Warp started is ending
+        if (!attached && !hook && !this.idleHooks) {
+          this.pushTail(Buffer.from(bytes));
+          return;
+        }
         this.idleOutput.push(Buffer.from(bytes));
         this.idleOutputBytes += bytes.length;
         while (this.idleOutputBytes > MAX_TAIL_BYTES && this.idleOutput.length > 1) {
@@ -137,11 +146,6 @@ class ShellRecorder {
     if (userPrecmd && attached) this.resetTail();
     if (userPreexec) this.running = true;
     if (ownHook && (hook.name === 'CommandFinished' || hook.name === 'Precmd')) this.running = false;
-    if (inputBuffer && !this.running) {
-      this.idleOutput = [];
-      this.idleOutputBytes = 0;
-      return;
-    }
     this.pushTail(Buffer.from(bytes));
   }
 
@@ -193,7 +197,7 @@ function partialMarkerStart(buf, from) {
 }
 
 /** The hook's name, session id (kept as a string: it's a u64) and whether it starts or ends an
- * in-band command (fish's start with a space). */
+ * in-band command (like Warp's `is_in_band_command`, which covers native completions too). */
 function parseHook(hex) {
   const json = Buffer.from(hex.toString('latin1'), 'hex').toString('utf8');
   const name = /"hook"\s*:\s*"(\w+)"/.exec(json)?.[1];
@@ -202,7 +206,7 @@ function parseHook(hex) {
     name,
     sessionId: /"session_id"\s*:\s*(\d+)/.exec(json)?.[1] ?? null,
     afterInBand: /"is_after_in_band_command"\s*:\s*true/.test(json),
-    inBand: /"command"\s*:\s*" ?warp_run_generator_command /.test(json),
+    inBand: /"command"\s*:\s*"\s*warp_run_generator_command/.test(json),
   };
 }
 
