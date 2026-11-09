@@ -2,9 +2,9 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { ShellRecorder } = require('../shellRecorder');
 
-// A Warp hook as the bootstrap prints it (DCS with hex JSON)
+// A Warp hook as the bootstrap prints it (DCS with hex JSON, spaced over lines)
 function hook(name, value = {}) {
-  const json = JSON.stringify({ hook: name, value: { ...value, session_id: 42 } });
+  const json = JSON.stringify({ hook: name, value: { ...value, session_id: 42 } }, null, 1);
   return `\x1bP$d${Buffer.from(json).toString('hex')}\x1b\\`;
 }
 
@@ -65,6 +65,34 @@ test("fish's completions, typed with a leading space, are left out too", () => {
 
   assert.equal(replayed(recorder), BOOTSTRAP + TITLE + PROMPT_HOOK + PROMPT);
   assert.equal(recorder.running, false);
+});
+
+test('native shell completions are left out too', () => {
+  const recorder = shellOutput(
+    BOOTSTRAP,
+    PROMPT_HOOK,
+    PROMPT,
+    ...inBandCommand('warp_run_generator_command_native_completions 67697420636865636b6f7574'),
+    INPUT_BUFFER,
+  );
+
+  assert.equal(replayed(recorder), BOOTSTRAP + TITLE + PROMPT_HOOK + PROMPT);
+  assert.equal(recorder.running, false);
+});
+
+test('output while no page shows the shell is kept for the next page', () => {
+  const recorder = shellOutput(BOOTSTRAP, PROMPT_HOOK, PROMPT, ...inBandCommand(), INPUT_BUFFER);
+  recorder.record(Buffer.from('server listening on :3000\r\n', 'latin1'), false);
+
+  assert.equal(replayed(recorder), BOOTSTRAP + TITLE + PROMPT_HOOK + PROMPT + 'server listening on :3000\r\n');
+});
+
+test('a completion still ending when the page went away is left out', () => {
+  const [inputBuffer, echo, preexec, ...ending] = inBandCommand();
+  const recorder = shellOutput(BOOTSTRAP, PROMPT_HOOK, PROMPT, inputBuffer, echo, preexec);
+  for (const chunk of ending) recorder.record(Buffer.from(chunk, 'latin1'), false);
+
+  assert.equal(replayed(recorder), BOOTSTRAP + TITLE + PROMPT_HOOK + PROMPT);
 });
 
 test("a reloaded page gets the user's running command with its echo", () => {
