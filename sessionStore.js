@@ -1,7 +1,7 @@
-// Tabs for the Warp panel, restored like desktop Warp restores its windows: the latest tab layout
-// (tabs, splits, titles, each pane's directory) and recent command blocks per pane, in the same
-// warp.sqlite as the command history (extension global storage, shared by all VS Code windows).
-// Warp sends the layout whenever it changes and each block when it finishes
+// Tabs for the Warp panel, restored like desktop Warp restores its windows: each workspace's latest
+// tab layout (tabs, splits, titles, each pane's directory) and recent command blocks per pane, in
+// the same warp.sqlite as the command history (extension global storage, shared by all VS Code
+// windows). Warp sends the layout whenever it changes and each block when it finishes
 // (`host_session` in app/src/platform/wasm.rs), and gets the latest of both at startup.
 
 const fs = require('fs');
@@ -10,8 +10,8 @@ const { DatabaseSync } = require('node:sqlite');
 
 /** Blocks kept per pane, newest first, like desktop Warp's per-pane limit. */
 const MAX_BLOCKS_PER_PANE = 100;
-/** Blocks of panes that haven't had a new block in this long are dropped. */
-const MAX_PANE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+/** Layouts and pane blocks that haven't been saved in this long are dropped. */
+const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** A layout or block bigger than this isn't stored (a block's output is already truncated). */
 const MAX_JSON_LENGTH = 4 * 1024 * 1024;
 
@@ -23,8 +23,10 @@ class SessionStore {
     // Every VS Code window has its own connection to this file.
     this.db.exec(`
       PRAGMA busy_timeout = 2000;
-      CREATE TABLE IF NOT EXISTS panel_session (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
+      -- One layout shared by every window opened another folder's tabs in a new window
+      DROP TABLE IF EXISTS panel_session;
+      CREATE TABLE IF NOT EXISTS panel_workspace_session (
+        workspace TEXT PRIMARY KEY NOT NULL,
         json TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -37,9 +39,10 @@ class SessionStore {
       CREATE INDEX IF NOT EXISTS panel_blocks_pane ON panel_blocks (pane_uuid, id);
     `);
     this.upsertSession = this.db.prepare(`
-      INSERT INTO panel_session (id, json, updated_at) VALUES (1, ?, ?)
-      ON CONFLICT (id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`);
-    this.selectSession = this.db.prepare('SELECT json FROM panel_session WHERE id = 1');
+      INSERT INTO panel_workspace_session (workspace, json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT (workspace) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`);
+    this.selectSession = this.db.prepare('SELECT json FROM panel_workspace_session WHERE workspace = ?');
+    this.dropOldSessions = this.db.prepare('DELETE FROM panel_workspace_session WHERE updated_at < ?');
     this.insertBlock = this.db.prepare(
       'INSERT INTO panel_blocks (pane_uuid, json, saved_at) VALUES (?, ?, ?)',
     );
@@ -54,10 +57,15 @@ class SessionStore {
         SELECT pane_uuid FROM panel_blocks GROUP BY pane_uuid HAVING MAX(saved_at) < ?)`);
   }
 
-  /** The latest layout and its panes' blocks (oldest first), as JSON for Warp; null if none. */
-  load() {
-    this.dropOldPanes.run(Date.now() - MAX_PANE_AGE_MS);
-    const row = this.selectSession.get();
+  /**
+   * The workspace's latest layout and its panes' blocks (oldest first), as JSON for Warp; null if none.
+   * @param {string} workspace the VS Code workspace's URI
+   */
+  load(workspace) {
+    const cutoff = Date.now() - MAX_AGE_MS;
+    this.dropOldSessions.run(cutoff);
+    this.dropOldPanes.run(cutoff);
+    const row = this.selectSession.get(workspace);
     if (!row) return null;
     let session;
     try {
@@ -73,11 +81,14 @@ class SessionStore {
     return JSON.stringify({ session, blocks });
   }
 
-  /** @param {string} json the layout, replacing the previous one (the latest window wins) */
-  saveSession(json) {
+  /**
+   * @param {string} workspace the VS Code workspace's URI
+   * @param {string} json the layout, replacing the workspace's previous one (the latest window wins)
+   */
+  saveSession(workspace, json) {
     if (typeof json !== 'string' || json.length > MAX_JSON_LENGTH) return;
     JSON.parse(json); // only store what Warp can read back
-    this.upsertSession.run(json, Date.now());
+    this.upsertSession.run(workspace, json, Date.now());
   }
 
   /** @param {string} paneUuid @param {string} json a finished block */
