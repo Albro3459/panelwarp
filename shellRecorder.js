@@ -5,7 +5,8 @@
 // since the latest prompt (the running command, or the idle prompt). Earlier blocks come back from
 // the tab store. Warp's own commands at the prompt (completions, history) are left out: only the
 // page that ran them can follow them, and a new page that got them showed no prompt until the
-// user's next command.
+// user's next command. An SSH session or subshell Warp bootstrapped is followed the same way,
+// after the output that started it (from the outer prompt through its bootstrap).
 //
 // Hooks are `ESC P $ d <hex JSON> ESC \` (DCS) or `ESC ] 9278 ; d ; <hex JSON> BEL` (OSC, used by
 // the SSH wrapper), with JSON like {"hook": "Precmd", "value": {"session_id": 123, ...}}.
@@ -29,6 +30,9 @@ const TAIL_HEAD_BYTES = 256 * 1024;
 const MAX_TAIL_BYTES = 4 * 1024 * 1024;
 /** `ESC ] 0 ;` or `ESC ] 2 ;` <title> BEL or ST */
 const TITLE = /\x1b\][02];[^\x07\x1b]*(?:\x07|\x1b\\)/g;
+/** `ESC P $ f` <JSON> `ESC \`: a subshell asking Warp to bootstrap it (InitSubshell, or
+ * SourcedRcFileForWarp from Warp's rc file snippet) */
+const SUBSHELL_REQUEST = /\x1bP\$f[^\x1b]*\x1b\\/g;
 
 class ShellRecorder {
   constructor() {
@@ -44,7 +48,11 @@ class ShellRecorder {
     this.tailHeadBytes = 0;
     this.tailRest = [];
     this.tailRestBytes = 0;
-    /** Whether the shell is running the user's command, rather than waiting at its prompt. */
+    /** SSH sessions and subshells the shell runs, innermost last, each with the output from the
+     * outer session's prompt through its bootstrap. */
+    this.nested = [];
+    /** Whether the innermost session is running the user's command, rather than waiting at its
+     * prompt. A new page drops its own writes while it is, so they don't reach the command. */
     this.running = false;
     /** The latest tab title the shell set, which comes before the prompt's hooks. */
     this.title = null;
@@ -112,12 +120,36 @@ class ShellRecorder {
       const titles = bytes.toString('latin1').match(TITLE);
       if (titles) this.title = Buffer.from(titles[titles.length - 1], 'latin1');
     }
+    // Prompts and commands of the innermost session count. Over SSH, the user's shell only runs ssh.
+    const level = hook?.sessionId
+      ? [this.sessionIds[0], ...this.nested.map((n) => n.sessionId)].indexOf(hook.sessionId)
+      : -1;
+    if (level >= 0 && level < this.nested.length) {
+      // An outer session is back (the user left SSH), so the nested ones' output belongs to its
+      // command
+      const chunks = [...this.nested.splice(level).map((n) => n.start), ...this.tailHead, ...this.tailRest];
+      this.resetTail();
+      for (const chunk of chunks) this.pushTail(chunk);
+      this.running = true;
+      this.idleOutput = null;
+    }
+    if (hook?.name === 'Bootstrapped' && level < 0 && this.sessionIds.includes(hook.sessionId)) {
+      this.pushTail(Buffer.from(bytes));
+      // A new page would act on a subshell's request again and type Warp's init into its prompt
+      const start = Buffer.concat([...this.tailHead, ...this.tailRest])
+        .toString('latin1')
+        .replace(SUBSHELL_REQUEST, '');
+      this.nested.push({ sessionId: hook.sessionId, start: Buffer.from(start, 'latin1') });
+      this.resetTail();
+      return;
+    }
+    const currentHook = level >= 0;
     // Warp's own (in-band) commands end with a Precmd too, without the prompt's details.
-    const userPrecmd = ownHook && hook.name === 'Precmd' && !hook.afterInBand;
-    const userPreexec = ownHook && hook.name === 'Preexec' && !hook.inBand;
+    const userPrecmd = currentHook && hook.name === 'Precmd' && !hook.afterInBand;
+    const userPreexec = currentHook && hook.name === 'Preexec' && !hook.inBand;
     // Warp asks for the input buffer whenever its input is up again, so what follows at the
     // prompt is Warp's own commands, or the echo of the user's
-    if (ownHook && hook.name === 'InputBuffer' && !this.running) {
+    if (currentHook && hook.name === 'InputBuffer' && !this.running) {
       this.idleOutput = [];
       this.idleOutputBytes = 0;
       this.idleHooks = false;
@@ -125,7 +157,7 @@ class ShellRecorder {
     }
     if (this.idleOutput) {
       if (!userPrecmd && !userPreexec) {
-        if (ownHook) this.idleHooks = true;
+        if (currentHook) this.idleHooks = true;
         // Warp only runs its commands while a page shows the shell, so output without one (a
         // background job's) is kept for the next page, unless a command Warp started is ending
         if (!attached && !hook && !this.idleHooks) {
@@ -145,7 +177,7 @@ class ShellRecorder {
     }
     if (userPrecmd && attached) this.resetTail();
     if (userPreexec) this.running = true;
-    if (ownHook && (hook.name === 'CommandFinished' || hook.name === 'Precmd')) this.running = false;
+    if (currentHook && (hook.name === 'CommandFinished' || hook.name === 'Precmd')) this.running = false;
     this.pushTail(Buffer.from(bytes));
   }
 
@@ -172,7 +204,13 @@ class ShellRecorder {
   /** The output to hand a new page, or null if this shell can't be taken over. */
   replay() {
     if (!this.adoptable || !this.bootstrapped) return null;
-    return [...this.bootstrap, ...(this.title ? [this.title] : []), ...this.tailHead, ...this.tailRest];
+    return [
+      ...this.bootstrap,
+      ...this.nested.map((n) => n.start),
+      ...(this.title ? [this.title] : []),
+      ...this.tailHead,
+      ...this.tailRest,
+    ];
   }
 }
 
