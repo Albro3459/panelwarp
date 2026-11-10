@@ -1,6 +1,6 @@
-# Per-thread tabs in one Warp instance
+# WIP: per-thread state in one Warp runtime
 
-Research from Nov 9, 2026. Nothing is built. This doc assumes the host contract in `/Users/abrodsky/.t3/worktrees/panelwarp/t3-code-warp/docs/t3-code-warp/panelwarp-host-contract.md` and the plan in `/Users/abrodsky/.t3/worktrees/panelwarp/t3-code-warp/docs/t3-code-warp/README.md`.
+Original source research from Nov 9, 2026, revised Nov 10. Nothing is built. The fixed requirement is one WASM runtime per T3 browser tab. The earlier tab-set swap is an implementation candidate, not a proven performance winner. Current decisions are in the [overview](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/README.md), with separate [performance evidence](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/performance.md) and [server-state options](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/server-state.md).
 
 Sources:
 
@@ -13,14 +13,22 @@ Everything was read in code or logs unless marked "unverified".
 ## Summary
 
 - panelwarp runs one wasm instance per VS Code window, not one shared instance. The PTY daemon, the tab store and the wasm cache are shared. Each instance restores only its own workspace's tabs at startup and never switches.
-- The wasm app has code paths for several windows, but upstream treats the web build as one window, and each window would get its own canvas and GPU context. Not a good base.
-- Recommended: **D. Tab sets swapped in memory.** Each thread owns a list of live tabs. On a thread switch, Warp moves the current `tabs` vector aside and puts the target thread's vector in its place. Shells stay connected, nothing reloads, and every tab feature (tab bar, vertical tabs, Cmd+1..9, cycling, close-last-tab) keeps working without changes because it only sees the active list. Threads not yet opened on this page restore from the host store with the existing restore and adoption code. Roughly 250 to 350 Rust lines, most in one new file, plus about 100 lines of JS.
+- Native Warp has multiple windows inside one app runtime. Its web build assumes one window, and creating physical windows also creates renderer resources. A logical thread workspace need not be a physical window or another runtime.
+- The current target is independent thread ownership inside one runtime, preferably sharing one physical canvas and renderer. Five tabs per thread is a possible product limit. It does not bound all panes, histories, or retained thread models.
+- **D. Tab sets swapped in memory** was the original recommendation. It avoids changing many tab-list consumers, but it parks live tabs outside the Workspace's active list. Background events and future workspace features can violate that assumption. The line-count estimate and switch latency need a prototype.
+- **E. Independent logical workspaces** and **F. Server-owned state** are now research candidates. T3's Ghostty implementation already separates host session lifetime from browser model lifetime, while sharing one WASM runtime. Avoid creating one runtime per thread or project.
+
+## Terms and ownership
+
+An app runtime owns application state and execution. A physical window owns a render surface, while a Workspace owns tabs and window UI state. A pane owns a terminal model, and the PTY host owns the shell. Those scopes coincide in some web paths today, but they are different concepts.
+
+Keep logical thread identity scoped by environment and thread, even when several threads share one project. Their worktrees and terminal state can differ. A project-wide runtime would still need this thread isolation. Runtime scope remains the T3 browser tab, including when that tab switches projects or environments.
 
 ## 1. How panelwarp scopes tabs today
 
 ### One instance per VS Code window
 
-The user's belief is half right. Each window only shows its own workspace's tabs, but each window runs its own wasm instance.
+Each VS Code window shows its own workspace's tabs and runs its own WASM application.
 
 | Piece | Scope | Evidence |
 | --- | --- | --- |
@@ -31,7 +39,7 @@ The user's belief is half right. Each window only shows its own workspace's tabs
 | Tab store `warp.sqlite` | Shared file, each window has its own connection | `/Users/abrodsky/GitHub/panelwarp/sessionStore.js:24`, `/Users/abrodsky/GitHub/panelwarp/sessionStore.js:25` |
 | Static origin (wasm cache) | Shared. Port kept in `globalState['warp.staticPort']` | `/Users/abrodsky/GitHub/panelwarp/extension.js:224`, `/Users/abrodsky/GitHub/panelwarp/extension.js:249` |
 
-So two VS Code windows mean two 111 MB wasm instances, each with its own tabs. Scoping happens because each instance asks for one key at startup.
+Two VS Code windows mean two running WASM applications, each with its own tabs. The earlier 111 MB figure described a WASM file, not the RAM cost of one instance. No per-instance browser memory measurement was made. Scoping happens because each instance asks for one key at startup.
 
 ### Session key
 
@@ -119,9 +127,11 @@ Code paths exist, but nothing in the web build uses them.
 - host.html sizes every `canvas` to `100vw x 100vh`. `/Users/abrodsky/GitHub/panelwarp/media/host.html:9`
 - The host session format already carries `windows: Vec<Window>` and `active_window_index`. VS Code always sends one. `/Users/abrodsky/GitHub/warp/app/src/platform/wasm.rs:555`
 
-Verdict: one canvas, one workspace in practice. Several windows might render, but focus, sizing and hiding are untested (unverified).
+Current behavior is one canvas and one workspace in practice. Several physical windows might render, but focus, sizing, hiding, and duplicated renderer memory are untested. Independent logical workspaces on one physical surface require different plumbing: the [registry](/Users/alexbrodsky/GitHub/warp/app/src/workspace/registry.rs:11) currently maps one Workspace per WindowId.
 
-## 3. Designs for one instance with tabs scoped per thread
+## 3. Designs within one runtime
+
+The estimates below describe the original source-based candidates. None was implemented or benchmarked, and they do not establish which architecture performs best. Keeping every visited thread live is a separate retention choice, not a consequence of sharing one runtime.
 
 ### A. Tab groups with a hidden flag
 
@@ -132,7 +142,7 @@ Every `TabData` gets a thread key (or reuses `group_id` with one `TabGroup` per 
 | Rust files | `/Users/abrodsky/GitHub/warp/app/src/workspace/view.rs` (tab bar slots, next and previous, Cmd+1..9, last tab, Ctrl+Tab MRU, close other tabs, close tabs to the right, move tab left and right, drag reorder, close-last-tab in `remove_tab`, `close_tab` and the `Exited` handler, undo close, `snapshot`, restore), `/Users/abrodsky/GitHub/warp/app/src/workspace/view/vertical_tabs.rs` (render list, search matches, binding hints), `/Users/abrodsky/GitHub/warp/app/src/tab.rs` (`tab_activate_binding_name`, menus), `/Users/abrodsky/GitHub/warp/app/src/search/command_palette/tabs/data_source.rs`, `/Users/abrodsky/GitHub/warp/app/src/platform/wasm.rs` (key in the saved layout, JS hook) |
 | JS files | `/Users/abrodsky/GitHub/panelwarp/media/host.html` (message to hook, `default_cwd`), the web host's session store keyed by page with a group key per tab |
 | Size | 400 to 700 lines over 15 to 20 touch points (estimate) |
-| Switch latency | One frame |
+| Switch latency | Expected in-memory switch, unmeasured |
 | Memory and CPU | Same as D. Plus every tab-bar render and every search walks hidden tabs too |
 | What the user notices | Instant switch. Any missed touch point leaks another thread's tabs. "Close other tabs" that misses the filter kills other threads' shells |
 | Conflicts | Patches 0050 and 0055 count `self.tabs.len() == 1`, which must become "tabs in the active group". Upstream `view.rs` had 42 commits from Aug 5 to Oct 5, 2026 (`git log c75f182`). Tab groups and pinning are active upstream work (`c72f36d6a` on Sep 14). This design touches most of that code |
@@ -147,7 +157,7 @@ On a switch, save the current tab set, drop those tabs while their shells stay i
 | JS files | host.html (hooks), web host (store per thread), `/Users/abrodsky/GitHub/panelwarp/server.js` (longer detached lifetime) |
 | Size | 150 to 250 Rust lines, about 80 JS lines (estimate) |
 | Switch latency | One WebSocket per pane, one replay per pane (73 KB median, up to 12 MB cap), parse of up to 100 saved blocks per pane, new views. Estimate 100 ms to over 1 s depending on panes and blocks (unverified). The tab bar empties and refills |
-| Memory and CPU | Lowest wasm memory: only the active thread's terminal models exist. The daemon holds each detached shell's recorder (bootstrap plus tail, up to 8 + 4 MB) and up to 2 MB pending. Detached shells are not polled by `stty` |
+| Memory and CPU | Limits live frontend models to the active thread. Relative memory savings are unmeasured, and the WASM allocator may reuse freed memory without shrinking linear memory. The daemon holds detached recorders and pending output. Detached shells skip the password poll |
 | What the user notices | Visible reload on every switch. Scroll position, selection, find bar, open AI panels and input state are lost (input state unverified). Only the last 100 blocks per pane return, each cut to 5000 lines. Output of a running command is kept only from its prompt, middle dropped past 4 MB. After 10 minutes away, the shells are gone (`DETACHED_TIMEOUT_MS`) and the tabs come back with fresh shells |
 | Conflicts | Must not trip patch 0064 (`Closed` detach sends `{"close": true}`) or patch 0055 (removing the last tab adds one). Patch 0026 reconnects a dropped socket on its own, so the pane models must be dropped, not just disconnected. Smaller upstream footprint than A |
 
@@ -161,11 +171,11 @@ Open a window per thread, draw only the active one.
 | JS files | host.html (canvas CSS, hook) |
 | Size | 150 to 300 lines (estimate), with unknown fixes after |
 | Switch latency | One frame if hiding works |
-| Memory and CPU | Highest. Each window has its own WebGL2 context, renderer, glyph atlas and a full `Workspace` with its palette, settings pane and other views. Browsers cap WebGL contexts per page, around 16 in Chrome (unverified) |
+| Memory and CPU | Duplicates renderer resources, glyph caches, and a full Workspace per physical window. The actual GPU/RAM cost and its ranking against other designs have not been measured |
 | What the user notices | Instant switch if it works |
 | Conflicts | Goes against an upstream assumption (`/Users/abrodsky/GitHub/warp/app/src/workspace/view.rs:26745`). Winit web hide is unsupported (unverified). A hidden `display: none` canvas may resize to 0 and shrink every PTY (unverified) |
 
-### D. Tab sets swapped in memory (recommended)
+### D. Tab sets swapped in memory
 
 Like A for the user, built like B. The `Workspace` keeps one live tab set per thread key. Only the active set is in `self.tabs`. On a switch, Warp moves `tabs`, `active_tab_index`, `tab_mru_order` and `tab_groups` into a map under the old key, then moves the target set in. Tabs are not closed, panes are not detached, sockets stay open. Upstream code that walks `self.tabs` needs no change, because it only ever sees the active thread.
 
@@ -181,35 +191,42 @@ Work list:
 | 4 | `Exited` from a parked tab: drop it from its set (today the handler finds no index and does nothing) | `/Users/abrodsky/GitHub/warp/app/src/workspace/view.rs:16388` | 15 |
 | 5 | Tag undo-close entries with the set key, or clear them on switch, so Cmd+Shift+T does not bring thread A's tab into thread B | near `/Users/abrodsky/GitHub/warp/app/src/workspace/view.rs:12793` | 10 to 20 |
 | 6 | `window.warpPanelSetTabSet(key, layoutJson)` hook with the `host_settings::Reload` pattern (Closure + channel + singleton model), plus a parser from host JSON to `WindowSnapshot` and blocks, reusing `host_session::load` internals | `/Users/abrodsky/GitHub/warp/app/src/platform/wasm.rs:886`, `/Users/abrodsky/GitHub/warp/app/src/platform/wasm.rs:620`, `/Users/abrodsky/GitHub/warp/app/src/lib.rs:2093` | 60 to 80 |
-| 7 | Save with the key: send the active set's layout with its key, and save the outgoing set once at switch time (a parked set's layout does not change) | `/Users/abrodsky/GitHub/warp/app/src/platform/wasm.rs:665` | 20 |
+| 7 | Save with the key: send the active set's layout with its key, save at switch time, and handle parked-set changes such as shell exits and directory updates | `/Users/abrodsky/GitHub/warp/app/src/platform/wasm.rs:665` | Original estimate 20, lifecycle coverage unverified |
 | 8 | host.html: `warp-set-thread {key, cwd, session}` -> rewrite `default_cwd` in `location.hash` with `history.replaceState`, then call the hook. Send `key` with `warp-save-session` | `/Users/abrodsky/GitHub/panelwarp/media/host.html:460`, `/Users/abrodsky/GitHub/panelwarp/media/host.html:567` | 30 |
-| 9 | Web host: store layouts by thread key (`sessionStore.js` works as is with a key like `t3-thread:<id>`), answer a layout request for a key | web host relay (new) | 40 to 60 |
+| 9 | Web host: store layouts by an environment/thread key, such as `t3-thread:<environmentId>:<threadId>`, and answer a layout request for that key | web host relay (new) | 40 to 60 |
 
-Total about 250 to 350 Rust lines, about 9 touch points in existing files, about 100 JS lines.
+Original estimate: about 250 to 350 Rust lines, about 9 touch points in existing files, and about 100 JS lines. This is not a validated estimate for lifecycle correctness, independent workspaces, or server-owned models.
 
 | Item | Detail |
 | --- | --- |
-| Switch latency | Threads already shown on this page: one frame plus the PTY resize of the new active tab (coalesced 50 ms, `/Users/abrodsky/GitHub/warp/app/src/terminal/remote_tty/event_loop.rs:101`). First visit of a thread with saved tabs: same as a page-reload restore for those tabs only |
-| Memory | Every thread shown on this page keeps its terminal models in wasm memory, the same as background tabs today. Wasm linear memory only grows, so closing threads does not return memory to the OS (standard wasm behavior) |
+| Switch latency | An already live set should avoid application startup and replay, but the proposed one-frame switch has not been measured. First restoration still creates models, replays history, and may start or attach shells |
+| Memory | An unbounded map retains every visited thread's models. Eviction can allow heap reuse, but there is no portable WASM linear-memory shrink operation or guarantee that browser RSS immediately falls |
 | CPU | Hidden tabs cost what background tabs cost today (see section 4) |
-| What the user notices | Instant switches. Each thread has its own tab bar, vertical tabs, Cmd+1..9 and cycling. Running programs keep running and their output is there on return |
-| Conflicts | Patches 0050, 0055 and 0064 keep working as is, because they act on `self.tabs`, which is the active set. Upstream churn hits only the small hooks in `view.rs`. Cross-window drag code assumes one `tabs` list per window, but cross-window drag cannot happen on wasm |
+| What the user notices | Intended behavior is fast switches and a thread-specific tab bar, cycling, and live shells. Correct restoration and background lifecycle handling remain unverified |
+| Conflicts | Much active-tab code could stay intact. Parked-tab exits, saving, pane lookup, undo-close, focus, notifications, and future workspace features still need review |
 
 Known gaps in D to handle:
 
 - Features that look up a pane across all tabs (`activate_tab_by_pane_group_id`, `/Users/abrodsky/GitHub/warp/app/src/workspace/view.rs:5374`, and the Agents panel's "running in Warp" status from patch 0054) will not see parked tabs. That is right for scoping. A notification click could ask the host to switch threads later
 - Warp's own tab groups inside a thread work, because `tab_groups` moves with the set
 
-### Recommendation
+### E. Independent logical workspaces on one render surface
 
-D, for these reasons:
+Keep thread-owned tabs and UI state in separate logical workspaces, then select which workspace the shared physical window renders. This preserves a complete ownership boundary instead of parking tabs outside their owning list.
 
-1. Switch speed equals A. Nothing reloads, no sockets reconnect.
-2. Patch size and upstream conflicts are close to B. Tab bar, vertical tabs, Cmd+1..9, cycling, Ctrl+Tab, close-last-tab and close-other-tabs need no change, so nothing can leak across threads.
-3. Shells of shown threads stay attached, so the 10-minute detached timeout does not apply while the page is open.
-4. It reuses the existing restore and adoption path (patches 0048, 0049) for the first visit of each thread.
+This is a proposed refactor. The existing WindowId-to-Workspace registry, focus routing, session saving, and global pane lookup need to understand it. Native multi-window support shares an app runtime but creates separate renderers, so it is not a drop-in implementation of this design.
 
-Add later if memory grows: evict the least recently shown tab set after N sets or M minutes hidden. Eviction saves its layout, drops its views without `Closed` detach (B's path), and leaves its shells detached in the daemon. This needs B's "drop without close" step and a longer detached lifetime.
+### F. Server-owned Warp state
+
+Keep shells and parsed terminal/block state in a native service beside T3. The one browser runtime renders the active workspace and requests snapshots, changed content, and history as needed. Background sessions need no continuously live frontend model.
+
+This requires a new state service and synchronization protocol. The existing host owns shells and replay bytes, while the browser currently builds Warp's blocks. T3's own server also retains raw history rather than a parsed terminal screen. See [server-owned state](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/server-state.md) for the extraction boundary and prototype.
+
+### Current recommendation
+
+Keep one browser runtime as the fixed constraint and evaluate explicit thread ownership before choosing the representation. Prototype a server-owned model for one pane and a shared-render-surface workspace switch. Use actual memory and output-processing profiles to decide how much frontend state to retain.
+
+A T3-like bounded viewer cache is useful even if the parser initially stays in the browser. Eviction saves the layout and drops views without closing shells, then restores from retained state on return. The current ten-minute detached timeout and truncated replay are not sufficient for an indefinite, exact-state guarantee. Define longer session lifetimes, recovery fidelity, and page-wide history/pane budgets as part of the design.
 
 Uncertain:
 
@@ -222,17 +239,17 @@ Uncertain:
 | Question | Answer | Evidence |
 | --- | --- | --- |
 | Is PTY output parsed while hidden? | Yes. Each pane's WebSocket stream feeds `process_pty_bytes`, which runs the ANSI parser into the terminal model whether or not the tab shows | `/Users/abrodsky/GitHub/warp/app/src/terminal/remote_tty/event_loop.rs:341`, `/Users/abrodsky/GitHub/warp/app/src/terminal/remote_tty/event_loop.rs:707` |
-| Does it trigger renders? | Yes. Each wakeup (throttled to 60 per second per pane) runs `handle_terminal_wakeup`, which always ends with `ctx.notify()`. A notify on any view invalidates its window. The window then re-renders that view and lays out and paints the whole visible tree | `/Users/abrodsky/GitHub/warp/app/src/terminal/view.rs:620`, `/Users/abrodsky/GitHub/warp/app/src/terminal/view.rs:3803`, `/Users/abrodsky/GitHub/warp/app/src/terminal/view.rs:10195`, `/Users/abrodsky/GitHub/warp/crates/warpui_core/src/core/app.rs:4112`, `/Users/abrodsky/GitHub/warp/crates/warpui_core/src/presenter.rs:318` |
+| Does it trigger UI work? | Each wakeup, throttled to 60 per second per pane, can update filters, heights, child views, and call `ctx.notify()`. Invalidation collects updated views and can be combined before presentation. Wakeup count is not a separately presented GPU-frame count | `/Users/alexbrodsky/GitHub/warp/app/src/terminal/view.rs:620`, `/Users/alexbrodsky/GitHub/warp/app/src/terminal/view.rs:10195`, `/Users/alexbrodsky/GitHub/warp/crates/warpui_core/src/core/app.rs:4112`, `/Users/alexbrodsky/GitHub/warp/crates/warpui_core/src/presenter.rs:318` |
 | Redraw only on change? | Yes. A frame is requested only when a window is invalidated. "An invalidation will repaint the entire element tree for that window" | `/Users/abrodsky/GitHub/warp/crates/warpui_core/src/core/app.rs:2679`, `/Users/abrodsky/GitHub/warp/crates/warpui_core/src/core/mod.rs:194`, `/Users/abrodsky/GitHub/warp/crates/warpui/src/windowing/winit/window.rs:1715` |
 | Timers | Cursor blink (500 ms) runs only in the focused editor of the active window. A long-running block sends one delayed wakeup. Reconnect timers only after a drop | `/Users/abrodsky/GitHub/warp/app/src/editor/view/mod.rs:136`, `/Users/abrodsky/GitHub/warp/app/src/editor/view/mod.rs:7575`, `/Users/abrodsky/GitHub/warp/app/src/terminal/model/block.rs:2552` |
 | Host side | While attached, the server runs `stty` once per second for every shell whose foreground process is not the shell, until it sees a password prompt. Detached shells skip it | `/Users/abrodsky/GitHub/panelwarp/server.js:86` |
-| Memory hints | 24 bytes per grid cell. Up to 50,000 rows per block by default (`terminal.maximum_grid_size`). Restored blocks: 100 per pane, 5000 lines each. Daemon per shell: replay median 73 KB measured, caps 8 MB bootstrap + 4 MB tail, plus 2 MB pending while detached. No per-tab measurement exists | `/Users/abrodsky/GitHub/warp/crates/warp_terminal/src/model/grid/cell_tests.rs:14`, `/Users/abrodsky/GitHub/warp/app/src/terminal/settings.rs:153`, `/Users/abrodsky/GitHub/panelwarp/shellRecorder.js:26` |
+| Memory hints | The native Cell-size test expects 24 bytes, not a verified wasm32 per-cell cost. Compact flat scrollback also exists, so multiplying all history by a Cell size is misleading. Grid limits, restored blocks, and recorder caps are ceilings rather than eager allocations. No per-pane browser memory measurement exists | `/Users/alexbrodsky/GitHub/warp/crates/warp_terminal/src/model/grid/cell_tests.rs:14`, `/Users/alexbrodsky/GitHub/warp/crates/warp_terminal/src/model/grid/flat_storage/mod.rs:1`, `/Users/alexbrodsky/GitHub/warp/app/src/terminal/model/block.rs:2894` |
 
-So an idle hidden tab costs memory and almost no CPU. A hidden tab with streaming output (a dev server, a build) parses all of it and causes up to 60 repaints per second of the visible tab. With D, many threads running dev servers multiply this, plus one `stty` spawn per second per running command in the daemon.
+An idle hidden tab retains memory. A hidden tab with streaming output continues parsing and can request UI work for the shared window. Many such panes multiply parsing and handler work, but source inspection does not establish 60 separate GPU repaints per pane per second. The daemon's password polling is a separate host CPU cost. None of these costs has been ranked with a live profile.
 
 Cheap follow-ups:
 
-- Skip `ctx.notify()` in `handle_terminal_wakeup` for panes not in the active tab and notify once when the tab becomes active (needs a way for the view to know, unverified)
+- Defer purely visual wakeup work and notifications for inactive panes, then refresh on activation. Keep parser state, terminal replies, and lifecycle events correct. Skipping only the final `ctx.notify()` would leave earlier handler work intact
 - Turn the `stty` poll off or slow it for shells whose pane is in a parked set
 - After load, host.html leaves `#loading` at `opacity: 0` with the infinite `pulse` animation still on `.mark`. It could set `display: none` after the fade. `/Users/abrodsky/GitHub/panelwarp/media/host.html:17`, `/Users/abrodsky/GitHub/panelwarp/media/host.html:18`
 
@@ -242,23 +259,23 @@ When the T3 drawer hides the iframe, browsers may throttle `requestAnimationFram
 
 ### Measured
 
-host.html logs phase times, in ms from the iframe's page start, through `warp-loaded` (`/Users/abrodsky/GitHub/panelwarp/media/host.html:91`, `/Users/abrodsky/GitHub/panelwarp/extension.js:287`). From the VS Code output logs (for example `/Users/abrodsky/Library/Application Support/Code/logs/20261109T160014/window1/exthost/output_logging_20261109T160015/1-Warp Terminal for VS Code.log`), 17 loads today:
+The original audit recorded cumulative phase timestamps in ms from iframe startup through `warp-loaded`. These are 17 historical VS Code loads, not T3 benchmarks or measurements rerun in the follow-up. Sources were `/Users/abrodsky/GitHub/panelwarp/media/host.html:91`, `/Users/abrodsky/GitHub/panelwarp/extension.js:287`, and VS Code logs under `/Users/abrodsky/Library/Application Support/Code/logs/20261109T160014/window1/exthost/output_logging_20261109T160015/1-Warp Terminal for VS Code.log`.
 
-| Source | Loads | Cache checked | Settings received | Compiled | Canvas shown |
+| Source | Loads | Cache checked | Settings received | Compile promise resolved | Canvas detected |
 | --- | --- | --- | --- | --- | --- |
 | Cache Storage hit | 15 | 10 ms median | 21 ms | 151 ms median (129 to 240) | 194 ms median (172 to 409) |
 | Network (new wasm build, 14 MB brotli from localhost) | 2 | 238 ms | 466 ms | 533 ms | 721 ms |
 
-"Canvas shown" is when the `<canvas>` exists. It does not include the shell prompt, the VS Code webview itself, or the PTY host start. Prompt time was not measured.
+“Canvas detected” is when a `<canvas>` exists. It does not establish a presented frame or usable prompt. The loading overlay fades later. The compile marker is cumulative and may include other waits before the promise is observed, not an isolated compiler duration. PTY host startup, first paint, and shell readiness were not measured.
 
-Not measured anywhere: wasm instance memory, linear memory size, renderer RSS. The memory monitor watches VS Code processes and warns above `host.memory_warning_gb` (default 3.5 GB, `/Users/abrodsky/GitHub/panelwarp/panelSettings.js:24`). Its comment says VS Code crashed one process at about 3.2 GB (`/Users/abrodsky/GitHub/panelwarp/memoryMonitor.js:106`). That is about VS Code processes in general, not Warp.
+Live WASM linear memory, browser RSS, and GPU allocations remain unmeasured. The later binary audit found a declared initial linear-memory minimum, which is not a live allocation profile. The VS Code process memory warning is not a per-Warp runtime measurement. See the [performance audit](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/performance.md).
 
 ### How the compiled code stays cached
 
 1. Stable origin: the static port is saved in `globalState['warp.staticPort']` and reused. A taken port falls back to a random one, which means a cold cache. `/Users/abrodsky/GitHub/panelwarp/extension.js:229`, `/Users/abrodsky/GitHub/panelwarp/server.js:585`
 2. `ETag: "<size>-<mtimeMs>"` with `Cache-Control: no-cache`, 304 on match. `/Users/abrodsky/GitHub/panelwarp/server.js:118`, `/Users/abrodsky/GitHub/panelwarp/server.js:555`
 3. `?wasm=<etag>` in the page URL lets host.html skip the `HEAD` request. `/Users/abrodsky/GitHub/panelwarp/extension.js:556`, `/Users/abrodsky/GitHub/panelwarp/media/host.html:101`
-4. host.html keeps the wasm in Cache Storage (`warp-wasm`), replaces old copies, and compiles with `compileStreaming(response)`, which lets the browser reuse its compiled code. `/Users/abrodsky/GitHub/panelwarp/media/host.html:98`, `/Users/abrodsky/GitHub/panelwarp/media/host.html:148`
+4. The loader keeps WASM bytes in Cache Storage (`warp-wasm`) and uses `compileStreaming(response)`. Compiled-code caching is a separate browser mechanism. A byte-cache hit does not prove a code-cache hit. `/Users/alexbrodsky/GitHub/panelwarp/media/host.html:98`
 
 For T3: pin the static port, pass `wasm=<etag>`, and keep the iframe origin the same across T3 restarts.
 
@@ -266,11 +283,11 @@ For T3: pin the static port, pass `wasm=<etag>`, and keep the iframe origin the 
 
 | | Lazy first open | Preload in a hidden iframe |
 | --- | --- | --- |
-| Time to canvas on first terminal open | About 0.2 s from cache, about 0.7 s after a new build (measured in VS Code), plus shell start | About 0 |
+| Loader cost at first terminal open | Historical canvas detection around 0.2 s from cached bytes and 0.7 s after a new build. Usable-prompt timing unknown | Can move some startup earlier if it finishes before opening, unmeasured |
 | Cost when the user never opens a terminal | None | The full instance memory (not measured) and background compile CPU on every T3 page load |
 | Risk | None new | A `display: none` iframe gives the canvas 0 size. Shells may start at a tiny size and then resize (unverified). Use an offscreen iframe with real size instead |
 
-Lazy load is cheap enough. A preload after T3 is idle is an option if 0.2 s matters (opinion).
+Load once on first open as the initial policy. Measure cold/warm first-prompt timing on the intended web clients before deciding whether idle preloading is useful. A thread switch within the already running runtime should bypass the application loader entirely.
 
 ## 6. cwd for new tabs at runtime
 
@@ -312,6 +329,6 @@ Constants to make settings: `DETACHED_TIMEOUT_MS` (with "never" as an option for
 
 - The `#pty_url` fragment is read for every new session, so the cwd for new tabs can change at runtime with no Warp patch.
 - Upstream already has tab groups (`TabData::group_id`, `TabGroup`, on by default). panelwarp's host session drops them on save. `/Users/abrodsky/GitHub/warp/app/src/platform/wasm.rs:833`
-- A hidden tab with streaming output repaints the visible tab up to 60 times per second. This affects panelwarp today, not only the T3 plan.
+- Hidden streaming output still reaches the parser and wakeup handlers. The resulting GPU frame rate needs measurement because invalidations can be combined.
 - The `stty` poll runs every second for every attached shell that runs a command. With many threads running dev servers, that adds up.
 - `Workspace` already moves tabs in and out of `self.tabs` without killing panes for cross-window drag (`remove_tab_without_undo`, `insert_transferred_tab_at_index`, `/Users/abrodsky/GitHub/warp/app/src/workspace/view.rs:28442`). That is the precedent for design D.

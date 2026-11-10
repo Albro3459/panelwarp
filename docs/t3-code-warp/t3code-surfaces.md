@@ -2,6 +2,10 @@
 
 Research notes on adding a "Warp (W)" entry to T3 Code's "Open a surface" list. The Warp page is one shared `<iframe>` for the whole browser page. It must never be unmounted, re-parented or reloaded. Scope is T3 Code 0.1.7 in web mode (`t3 serve` on `http://127.0.0.1:3773`).
 
+Nov 10 clarification: one shared WASM application per T3 browser tab is a fixed requirement. Sharing a physical canvas/renderer between independent thread workspaces is a target requiring a prototype. Keeping the iframe alive does not require keeping every thread's terminal model live forever. Host session lifetime and frontend viewer retention should be separate. The [overview](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/README.md) records those decisions, and the [server-state study](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/server-state.md) examines moving terminal processing to a separate service.
+
+This document's patch sizes and build recipes cover surface integration at the original version. They do not include independent workspace plumbing, a server-owned terminal model, or a validated authenticated remote route.
+
 Earlier work: `/Users/abrodsky/.t3/worktrees/panelwarp/t3-code-warp/docs/t3-code-warp/t3code-terminal.md` and `/Users/abrodsky/.t3/worktrees/panelwarp/t3-code-warp/docs/t3-code-warp/README.md`. This doc does not repeat them.
 
 ## Sources
@@ -344,7 +348,7 @@ Option A, with optional sugar:
 | Release pace | 9 stable releases in 25 days, 510 commits from 0.1.7 to 0.1.8 | same | same |
 | What breaks when T3 changes | Anything | Patch hunks in `RightPanelTabs.tsx` or ChatView props. Typecheck flags new exhaustive switches | Selectors, launcher markup, URL shape, API routes. Breaks quietly at runtime |
 
-Recommendation: fork-lite with the additive `warp` surface patch, pinned to the installed version, upgraded by a script. Build the iframe host as standalone code so the injection route (option A) can serve as a fallback on a release where the patch does not apply. A full fork adds server upkeep without UX gain.
+For surface integration, the source-based preference remains an additive `warp` patch to a pinned client, with the host kept separate so injection can serve as a fallback. The original client-only build/deployment path has not been validated. A separate Warp Rust service could still run beside a stock T3 server, but its routing, authentication, and protocol are additional work. A full T3 server fork is a different decision from whether Warp owns state on the host.
 
 ## Surprises
 

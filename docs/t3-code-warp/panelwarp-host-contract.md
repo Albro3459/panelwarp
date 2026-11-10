@@ -8,6 +8,14 @@ What the Warp wasm app needs from its host, and which parts of panelwarp depend 
 
 Everything below was read in the code unless it is marked "unverified".
 
+## Nov 10 scope clarification
+
+The process described here owns shells, replay bytes, persisted layouts, and finished blocks sent by the browser. It does not own Warp's live parsed terminal model. When a browser detaches, recording output does not by itself continue constructing Warp command blocks on the server. The original `/Users/abrodsky/...` paths below are historical source locations.
+
+The current requirement is one Warp WASM runtime per T3 browser tab, with thread-owned state and a preferred shared physical renderer. A PTY host can run beside the T3 environment independently of its web UI. For remote access it must run on the machine containing the project and have an authenticated route reachable by the browser. A remote browser's `127.0.0.1` points to that browser's device, not the project host.
+
+T3's Ghostty backend is a useful model for separating shell lifetime, output subscriptions, bounded replay, and lightweight metadata. Its emulator still runs in the browser. A native Warp service that parses output and owns grids, modes, and block lifecycle would be a new backend boundary, not just a new entry point for this Node daemon. See [server-owned state](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/server-state.md) and [performance evidence](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/performance.md).
+
 ## 1. Process layout
 
 ```

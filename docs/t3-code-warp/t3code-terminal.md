@@ -1,6 +1,36 @@
 # T3 Code terminal: how it works and where to plug in Warp
 
-Research notes for replacing or adding to the T3 Code web terminal with a Warp wasm page in an `<iframe>`. Scope is T3 Code 0.1.7 in web mode (`npx t3@latest serve --host 127.0.0.1 --port 3773`).
+Research notes for adding Warp to T3 Code web. The original sections target T3 Code 0.1.7 in web mode. The Nov 10 follow-up below verifies the runtime and session boundaries against a newer pinned source snapshot. No terminal throughput or browser memory benchmark was run.
+
+## Nov 10: verified runtime and session boundaries
+
+Follow-up source: [T3 commit `73fb49d`](https://github.com/pingdotgg/t3code/tree/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be), inspected in `/Users/alexbrodsky/.t3/scratch/2026-11-10-can-you-research-how-t3-4000ee20/t3code`. Related research: [Remote Per-Thread Terminal Performance fork](t3-thread://v2/d15cb9d9-075b-4ef1-89ab-cd02514e01c7/143a8fa3-a3a4-4354-ae07-36756a5dffee).
+
+T3 already shares one main Ghostty WASM runtime per browser tab. Each terminal allocates its own Ghostty handles within that runtime, then frees them on disposal. This is the ownership model wanted for Warp, although Warp's WASM build contains its application UI rather than just an embeddable VT library. T3 also loads a tiny PTY callback trampoline WASM module, not a separate application runtime per terminal. Sources: [runtime singleton](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/web/src/terminal/ghostty/runtime.ts), [terminal core](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/web/src/terminal/ghostty/core.ts), [adapter overview](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/web/src/terminal/ghostty/README.md).
+
+| Responsibility | Owner in T3 |
+| --- | --- |
+| Shell processes, cwd, session lifetime, metadata | Environment server |
+| Bounded raw output history and persistence | Environment server |
+| ANSI parsing, screen/scrollback, cursor and terminal modes | Browser's per-terminal Ghostty state |
+| Canvas drawing, input, selection, scrolling | Browser adapter |
+
+The server's `TerminalSessionSnapshot.history` is retained raw terminal output. The browser resets its Ghostty terminal and replays that text. A snapshot here is not a serialized server-side emulator grid. Replaying a bounded tail can lose state created before the retained output, especially for full-screen programs and resize-sensitive output. Sources: [manager snapshot](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/server/src/terminal/Manager.ts), [browser reset/replay](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/web/src/terminal/ghostty/core.ts).
+
+The transferable performance choices are:
+
+- **Independent lifetimes.** A shell remains on the host without requiring a mounted browser terminal. Disposing a viewer frees its local handles without making the process lifetime a UI concern
+- **Metadata separate from output.** Terminal summaries exclude history, and ordinary output does not need to republish the metadata list. Clients can list sessions without subscribing to every stream
+- **Bounded retention.** Server raw history is limited to 5,000 lines and 8 MiB of UTF-8 output. Client transport buffers have a separate 512 KiB limit. History appends are incremental, and disk writes are coalesced with a 250 ms delay
+- **Pipelined flow control.** Output streams allow an acknowledgement window of eight chunks or about 64 KiB of encoded messages. A subscriber's queued-output budget is about 8 MiB, with explicit resynchronization from retained history when it falls behind. This avoids one network round trip for every small output event
+- **Visibility-aware drawing.** Hiding a surface cancels rendering, but retained hidden surfaces still feed output to the browser parser. Hidden does not mean zero parsing or zero memory
+- **Bounded drawer retention.** The chat drawer keeps at most ten hidden thread views plus its active view. That is a drawer cache policy, not a cap on all backend sessions or a measured optimum for Warp
+
+Sources: [terminal runtime decisions](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/docs/internals/terminal-runtime.md), [output protocol](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/server/src/terminal/OutputProtocol.ts), [surface visibility](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/web/src/terminal/ghostty/surface.ts), [drawer limit](https://github.com/pingdotgg/t3code/blob/73fb49d0b3a61bff74aebc362fc6c17d6c0d39be/apps/web/src/components/ChatView.logic.ts).
+
+For Warp, copying these lifetime and transport choices would reduce frontend retention without first moving the parser. Moving parsed terminal state and command blocks to a Rust service is a larger option. It needs Warp's shell hooks and block lifecycle, an exact snapshot/update boundary, and a single owner for terminal replies. The [server-state study](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/server-state.md) records that boundary and a proposed prototype.
+
+The remaining sections preserve the versioned 0.1.7 integration observations. Their file counts, entry points, limits, and build recipes need checking against the version chosen for implementation.
 
 ## Sources and how to read this doc
 
@@ -231,6 +261,8 @@ This survives version updates, because nothing under `/Users/abrodsky/.t3/` is e
 - Cheapest fork (unverified): build only `apps/web` from tag `v0.1.7` and copy its `dist/` over `/Users/abrodsky/.t3/runtime/versions/0.1.7/client/`. The official server keeps running. The web build must match the server version because of the orchestration protocol and RPC schemas.
 
 ### Files a "swap the terminal for an iframe" change touches
+
+This was an early viewport-replacement option. Do not create a Warp iframe/runtime for every thread: the current requirement is one application runtime per browser tab. Prefer the separately hosted Warp surface described in the [surface study](/Users/alexbrodsky/GitHub/panelwarp/docs/t3-code-warp/t3code-surfaces.md), with logical per-thread state inside that runtime.
 
 | File | Change |
 | --- | --- |
