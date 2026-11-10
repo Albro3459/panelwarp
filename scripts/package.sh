@@ -4,6 +4,7 @@
 #   target:  darwin-arm64 (default), darwin-x64, win32-arm64, win32-x64
 #   profile: Warp build profile whose bundle to ship (default release-wasm; build it with
 #            scripts/build-warp.sh --release)
+#   PACKAGE_VERSION=<version> packages under that version instead of package.json's
 # Builds in a staging copy, so the working tree stays as it is:
 #   - the extension's JS and its pure-JS dependencies become bundled extension.js and daemon.js
 #     (the PTY host) (esbuild);
@@ -66,6 +67,7 @@ mv "$STAGE.extension.js" "$STAGE/extension.js" && mv "$STAGE.daemon.js" "$STAGE/
 node -e '
   const fs = require("fs"), file = process.argv[1], pkg = JSON.parse(fs.readFileSync(file));
   pkg.dependencies = { "node-pty": pkg.dependencies["node-pty"] };
+  if (process.env.PACKAGE_VERSION) pkg.version = process.env.PACKAGE_VERSION;
   fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
 ' "$STAGE/package.json"
 rm -f "$STAGE/package-lock.json"
