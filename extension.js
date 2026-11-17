@@ -377,6 +377,9 @@ class WarpViewProvider {
       case 'warp-open-settings':
         await this.settingsFile.open();
         break;
+      case 'warp-open-keybindings':
+        await this.settingsFile.openKeybindings();
+        break;
       case 'warp-resolve-paths': {
         let value = [];
         try {
@@ -578,6 +581,7 @@ function webviewHtml(server, keys) {
       'warp-loaded',
       'warp-record-command',
       'warp-open-settings',
+      'warp-open-keybindings',
       'warp-resolve-paths',
       'warp-open-file',
       'warp-reveal-file',

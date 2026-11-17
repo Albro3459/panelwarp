@@ -243,6 +243,9 @@
       // Called by our Warp build for "Open settings file" (app/src/platform/wasm.rs); the
       // extension opens a settings.toml in a VS Code editor.
       window.warpPanelOpenSettingsFile = () => toExtension({ type: 'warp-open-settings' });
+      // And for "Open keybindings file" on Warp's keyboard shortcuts page, which shows only when
+      // this exists; the extension opens keybindings.yaml.
+      window.warpPanelOpenKeybindingsFile = () => toExtension({ type: 'warp-open-keybindings' });
       // Clickable file paths in terminal output (app/src/terminal/view/link_detection.rs): the
       // extension checks which possible paths exist (filePaths.js) and opens or reveals them.
       const pendingPaths = new Map();
