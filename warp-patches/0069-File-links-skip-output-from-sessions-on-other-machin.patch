@@ -1,0 +1,169 @@
+From 387250630a540fe94ef095e810ec58111bb12143 Mon Sep 17 00:00:00 2001
+From: Alex Brodsky <122503996+Albro3459@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:58:15 -0800
+Subject: [PATCH 69/69] File links skip output from sessions on other machines
+
+Warp's web build counts every session as remote, so it handed the host page paths from SSH and container sessions too. The host checked them on its own machine and underlined files that happened to exist there, like /etc/hosts or ~/.zshrc, and Cmd+click opened the wrong machine's file. A block now gets no file links when its host differs from the pane's first shell, found by following each session's spawning session up from the prompt. A block keeps the host it recorded, so restored blocks are covered too. An unknown host keeps the old behaviour, and plain ssh without Warpify still links, since its output belongs to the local shell. Desktop is unchanged
+
+Verified with a link detection test and wasm checks with and without terminal_only
+---
+ app/src/terminal/model/session.rs             |  4 ++
+ app/src/terminal/view/link_detection.rs       | 59 ++++++++++++++++---
+ app/src/terminal/view/link_detection_tests.rs | 40 +++++++++++++
+ 3 files changed, 95 insertions(+), 8 deletions(-)
+
+diff --git a/app/src/terminal/model/session.rs b/app/src/terminal/model/session.rs
+index 3b09b4f..7dd0b97 100644
+--- a/app/src/terminal/model/session.rs
++++ b/app/src/terminal/model/session.rs
+@@ -995,6 +995,10 @@ impl Session {
+         self.info.hostname.as_str()
+     }
+ 
++    pub fn spawning_session_id(&self) -> Option<SessionId> {
++        self.info.spawning_session_id
++    }
++
+     pub fn session_type(&self) -> SessionType {
+         self.session_type.lock().clone()
+     }
+diff --git a/app/src/terminal/view/link_detection.rs b/app/src/terminal/view/link_detection.rs
+index 2969cb9..a74d527 100644
+--- a/app/src/terminal/view/link_detection.rs
++++ b/app/src/terminal/view/link_detection.rs
+@@ -24,6 +24,12 @@ cfg_if::cfg_if! {
+     }
+ }
+ 
++#[cfg(all(feature = "file_links", any(test, not(feature = "local_fs"))))]
++use {
++    crate::terminal::model::session::{Session, Sessions},
++    std::{collections::HashSet, sync::Arc},
++};
++
+ cfg_if::cfg_if! {
+     if #[cfg(feature = "local_fs")] {
+         use crate::{
+@@ -614,22 +620,59 @@ impl super::TerminalView {
+     }
+ 
+     /// The directory relative paths at `position` are relative to. Every session counts as
+-    /// remote over the remote PTY, so this skips the local-session checks; the host resolves
+-    /// paths on the machine the shell runs on.
++    /// remote over the remote PTY, so this compares hostnames instead: the host resolves paths
++    /// on its own machine, so blocks from a Warpified SSH or container session get no file links.
+     #[cfg(not(feature = "local_fs"))]
+     fn file_link_working_directory(
+         &self,
+         position: WithinModel<Point>,
+-        _ctx: &mut ViewContext<Self>,
++        ctx: &mut ViewContext<Self>,
+     ) -> Option<String> {
+         let model = self.model.lock();
+         let block_list = model.block_list();
+-        match position {
+-            WithinModel::AltScreen(_) => block_list.active_block().pwd().map(String::from),
+-            WithinModel::BlockList(inner) => block_list
+-                .block_at(inner.block_index)
+-                .and_then(|block| block.pwd().map(String::from)),
++        let block = match position {
++            WithinModel::AltScreen(_) => Some(block_list.active_block()),
++            WithinModel::BlockList(inner) => block_list.block_at(inner.block_index),
++        }?;
++        let sessions = self.sessions.as_ref(ctx);
++        // A restored block keeps its host, but its session may never be registered again
++        let hostname = block.shell_host().map(|host| host.hostname).or_else(|| {
++            let session = sessions.get(block.session_id()?)?;
++            Some(session.hostname().to_owned())
++        });
++        let active_session = block_list
++            .active_block()
++            .session_id()
++            .and_then(|id| sessions.get(id));
++        if let (Some(hostname), Some(active_session)) = (hostname, active_session)
++            && Self::is_on_other_host(&hostname, active_session, sessions)
++        {
++            return None;
++        }
++        block.pwd().map(String::from)
++    }
++
++    /// Whether `hostname` is another machine than the pane's first session, found by following
++    /// spawning sessions up from `session`. An unknown hostname counts as the same machine.
++    #[cfg(any(test, not(feature = "local_fs")))]
++    pub(super) fn is_on_other_host(
++        hostname: &str,
++        session: Arc<Session>,
++        sessions: &Sessions,
++    ) -> bool {
++        let mut first_session = session;
++        let mut seen = HashSet::new();
++        while seen.insert(first_session.id())
++            && let Some(parent) = first_session
++                .spawning_session_id()
++                .and_then(|id| sessions.get(id))
++        {
++            first_session = parent;
+         }
++        let first_hostname = first_session.hostname();
++        !hostname.is_empty()
++            && !first_hostname.is_empty()
++            && !hostname.eq_ignore_ascii_case(first_hostname)
+     }
+ 
+     /// The paths to check, in order of preference, for each possible path (longest first): the
+diff --git a/app/src/terminal/view/link_detection_tests.rs b/app/src/terminal/view/link_detection_tests.rs
+index 0067639..8e44723 100644
+--- a/app/src/terminal/view/link_detection_tests.rs
++++ b/app/src/terminal/view/link_detection_tests.rs
+@@ -6,6 +6,7 @@ use super::super::TerminalView;
+ use super::{GridHighlightedLink, path_without_trailing_sentence_punctuation};
+ use crate::terminal::model::grid::grid_handler::PossiblePath;
+ use crate::terminal::model::index::Point;
++use crate::terminal::model::session::{SessionInfo, Sessions};
+ use crate::terminal::model::terminal_model::WithinModel;
+ 
+ #[test]
+@@ -209,3 +210,42 @@ fn compute_valid_paths_keeps_trailing_fullwidth_punctuation_when_it_is_the_filen
+         }
+     );
+ }
++
++#[test]
++fn sessions_on_another_host_than_the_first_session() {
++    let mut sessions = Sessions::new_for_test();
++    for (id, hostname, spawning_session_id) in [
++        (1u64, "laptop", None::<u64>),
++        (2, "laptop", Some(1)),
++        (3, "server", Some(2)),
++        (4, "server", Some(3)),
++        (5, "server", Some(5)),
++        (6, "server", Some(99)),
++        (7, "", None),
++        (8, "server", Some(7)),
++    ] {
++        sessions.register_session_for_test(SessionInfo {
++            spawning_session_id: spawning_session_id.map(Into::into),
++            ..SessionInfo::new_for_test()
++                .with_id(id)
++                .with_hostname(hostname.to_owned())
++        });
++    }
++    // A block's hostname, with the prompt in `active_id`
++    let is_on_other_host = |hostname: &str, active_id: u64| {
++        TerminalView::is_on_other_host(hostname, sessions.get(active_id.into()).unwrap(), &sessions)
++    };
++
++    // Blocks on the first session's machine, with the prompt in a local subshell or over SSH
++    assert!(!is_on_other_host("laptop", 2));
++    assert!(!is_on_other_host("Laptop", 4));
++    // Blocks from SSH, also after the SSH session ended
++    assert!(is_on_other_host("server", 4));
++    assert!(is_on_other_host("server", 1));
++    // Unknown hostnames, the block's or the first session's
++    assert!(!is_on_other_host("", 4));
++    assert!(!is_on_other_host("server", 8));
++    // A session that names itself as its spawner, or a spawner that isn't registered, ends the walk
++    assert!(!is_on_other_host("server", 5));
++    assert!(!is_on_other_host("server", 6));
++}
