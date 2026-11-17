@@ -1,0 +1,203 @@
+From dd4d8c16ef480d2844a1dae20a020eeb9303fa28 Mon Sep 17 00:00:00 2001
+From: Alex Brodsky <122503996+Albro3459@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:58:15 -0800
+Subject: [PATCH 68/68] Keyboard shortcuts page opens the keybindings file
+ through the host
+
+The web build keeps keybindings in localStorage, and nothing in Warp opened keybindings.yaml. The keyboard shortcuts page now shows an "Open keybindings file" button on its own row under the page description when the host page defines window.warpPanelOpenKeybindingsFile, and calls it on click. Desktop and pages without the hook show nothing new. wasm.rs gets host_has_function for UI that needs a host hook
+
+Verified with wasm checks with and without terminal_only, the settings view tests, and a browser test of the button
+---
+ app/src/platform/wasm.rs             | 17 ++++++
+ app/src/settings_view/keybindings.rs | 82 +++++++++++++++++++++++++++-
+ 2 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/platform/wasm.rs b/app/src/platform/wasm.rs
+index 7653e38..46c172b 100644
+--- a/app/src/platform/wasm.rs
++++ b/app/src/platform/wasm.rs
+@@ -30,6 +30,9 @@ mod ffi {
+         #[wasm_bindgen(js_name = "warpPanelOpenSettingsFile", catch)]
+         pub fn open_settings_file_in_host() -> Result<(), JsValue>;
+ 
++        #[wasm_bindgen(js_name = "warpPanelOpenKeybindingsFile", catch)]
++        pub fn open_keybindings_file_in_host() -> Result<(), JsValue>;
++
+         #[wasm_bindgen(js_name = "warpPanelStoreApiKey", catch)]
+         pub fn store_api_key(provider: &str, key: &str) -> Result<(), JsValue>;
+ 
+@@ -362,6 +365,20 @@ pub fn open_settings_file_in_host() -> bool {
+     ffi::open_settings_file_in_host().is_ok()
+ }
+ 
++/// Asks the embedding host app to open its keybindings file, since the web build keeps
++/// keybindings in localStorage. Returns false if the host doesn't provide
++/// `window.warpPanelOpenKeybindingsFile`.
++pub fn open_keybindings_file_in_host() -> bool {
++    ffi::open_keybindings_file_in_host().is_ok()
++}
++
++/// Whether the host page defines `window[name]` as a function, for UI that only works with
++/// that hook.
++pub fn host_has_function(name: &str) -> bool {
++    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(name))
++        .is_ok_and(|value| value.is_function())
++}
++
+ #[derive(Debug, Clone, Error)]
+ pub enum AuthHandoffError {
+     #[error("The host page doesn't support user handoff")]
+diff --git a/app/src/settings_view/keybindings.rs b/app/src/settings_view/keybindings.rs
+index b71e5d0..2310aa0 100644
+--- a/app/src/settings_view/keybindings.rs
++++ b/app/src/settings_view/keybindings.rs
+@@ -1,6 +1,7 @@
+ use std::collections::HashMap;
+ 
+ use itertools::Itertools;
++use warp_core::ui::color::coloru_with_opacity;
+ use warp_core::ui::theme::color::internal_colors;
+ use warp_errors::report_error;
+ use warpui::elements::{
+@@ -9,8 +10,9 @@ use warpui::elements::{
+     Hoverable, MouseState, MouseStateHandle, ParentElement, Radius, SavePosition, ScrollbarWidth,
+     Shrinkable, Text, Wrap,
+ };
+-use warpui::fonts::Weight;
++use warpui::fonts::{Properties, Weight};
+ use warpui::keymap::{DescriptionContext, Keystroke, Trigger};
++use warpui::platform::Cursor;
+ use warpui::presenter::ChildView;
+ use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+ use warpui::units::Pixels;
+@@ -31,6 +33,7 @@ use crate::editor::{
+ use crate::keyboard::{UserDefinedKeybinding, write_custom_keybinding};
+ use crate::search_bar::SearchBar;
+ use crate::settings::CloudPreferencesSettings;
++use crate::ui_components::icons::Icon;
+ use crate::util::bindings::{
+     CommandBinding, filter_bindings_including_keystroke, is_binding_hidden,
+     reset_keybinding_to_default, set_custom_keybinding,
+@@ -52,6 +55,10 @@ const RESET_BUTTON_TEXT: &str = "Default";
+ const CANCEL_BUTTON_TEXT: &str = "Cancel";
+ const CLEAR_BUTTON_TEXT: &str = "Clear";
+ const SAVE_BUTTON_TEXT: &str = "Save";
++// The settings footer's alert button height
++const OPEN_KEYBINDINGS_FILE_BUTTON_HEIGHT: f32 = 24.;
++const OPEN_KEYBINDINGS_FILE_FONT_SIZE: f32 = 12.;
++const OPEN_KEYBINDINGS_FILE_ICON_SIZE: f32 = 16.;
+ 
+ /// Notifier for custom keybinding changed. Views could subscribe to this for
+ /// KeybindingChangedEvent.
+@@ -167,6 +174,7 @@ pub enum KeybindingsViewAction {
+     CancelKeyStrokeEditing(usize),
+     ConfirmKeyStroke(usize),
+     RemoveKeyStroke(usize),
++    OpenKeybindingsFile,
+ }
+ 
+ #[derive(Default, Clone)]
+@@ -850,6 +858,10 @@ impl TypedActionView for KeybindingsView {
+             KeystrokeDefined(index, key) => {
+                 self.set_temporary_keystroke_state(*index, key.clone(), ctx)
+             }
++            OpenKeybindingsFile => {
++                #[cfg(target_family = "wasm")]
++                crate::platform::wasm::open_keybindings_file_in_host();
++            }
+         }
+     }
+ }
+@@ -913,6 +925,57 @@ fn render_button(
+     .finish()
+ }
+ 
++/// Styled like the settings sidebar's "Open settings file" button, sized to its label.
++fn render_open_keybindings_file_button(
++    appearance: &Appearance,
++    mouse_state: MouseStateHandle,
++) -> Box<dyn Element> {
++    let theme = appearance.theme();
++    let text_fill = theme.nonactive_ui_text_color();
++    let text_color = text_fill.into_solid();
++    let border_color = theme.outline().into_solid();
++    let ui_font_family = appearance.ui_font_family();
++
++    let button = Hoverable::new(mouse_state, move |state| {
++        let icon = ConstrainedBox::new(Icon::Code2.to_warpui_icon(text_fill).finish())
++            .with_width(OPEN_KEYBINDINGS_FILE_ICON_SIZE)
++            .with_height(OPEN_KEYBINDINGS_FILE_ICON_SIZE)
++            .finish();
++        let label = Text::new_inline(
++            "Open keybindings file",
++            ui_font_family,
++            OPEN_KEYBINDINGS_FILE_FONT_SIZE,
++        )
++        .with_color(text_color)
++        .with_style(Properties {
++            weight: Weight::Semibold,
++            ..Default::default()
++        })
++        .finish();
++        let row = Flex::row()
++            .with_cross_axis_alignment(CrossAxisAlignment::Center)
++            .with_child(Container::new(icon).with_margin_right(4.).finish())
++            .with_child(label)
++            .finish();
++
++        let mut container = Container::new(row)
++            .with_horizontal_padding(12.)
++            .with_border(Border::all(1.).with_border_color(border_color))
++            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
++        if state.is_hovered() {
++            container = container.with_background_color(coloru_with_opacity(text_color, 10));
++        }
++
++        ConstrainedBox::new(container.finish())
++            .with_height(OPEN_KEYBINDINGS_FILE_BUTTON_HEIGHT)
++            .finish()
++    })
++    .with_cursor(Cursor::PointingHand)
++    .on_click(|ctx, _, _| ctx.dispatch_typed_action(KeybindingsViewAction::OpenKeybindingsFile))
++    .finish();
++    Container::new(button).with_margin_top(12.).finish()
++}
++
+ fn render_text(
+     text: &str,
+     styles: Option<UiComponentStyles>,
+@@ -962,6 +1025,7 @@ fn trigger_keybinding_notifier(
+ #[derive(Default)]
+ struct KeybindingsWidget {
+     local_only_icon_mouse_state: MouseStateHandle,
++    open_keybindings_file_mouse_state: MouseStateHandle,
+ }
+ 
+ impl KeybindingsWidget {
+@@ -1121,10 +1185,26 @@ impl SettingsWidget for KeybindingsWidget {
+             local_only_icon_state,
+         );
+         let description = self.render_description(view.bindings.as_ref(), appearance);
++        // The web build keeps keybindings in localStorage, so only a host page with a file
++        // for them can open one. On its own row, so a narrow panel doesn't clip the title
++        #[cfg(target_family = "wasm")]
++        let can_open_keybindings_file =
++            crate::platform::wasm::host_has_function("warpPanelOpenKeybindingsFile");
++        #[cfg(not(target_family = "wasm"))]
++        let can_open_keybindings_file = false;
++        let open_keybindings_file_button = can_open_keybindings_file.then(|| {
++            Align::new(render_open_keybindings_file_button(
++                appearance,
++                self.open_keybindings_file_mouse_state.clone(),
++            ))
++            .left()
++            .finish()
++        });
+ 
+         Flex::column()
+             .with_child(subheader)
+             .with_child(description)
++            .with_children(open_keybindings_file_button)
+             .with_child(render_columns(
+                 Container::new(render_text(
+                     "Command",
