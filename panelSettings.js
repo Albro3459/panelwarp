@@ -17,6 +17,7 @@ const DEFAULTS = {
   HostAiNextCommand: false,
   HostAiPromptSuggestions: false,
   HostAiPromptSuggestionsAgent: 'claude',
+  HostSettingsSync: true,
   HostHistorySync: false,
   HostAiLocalModel: '',
   HostAiLocalServer: 'http://127.0.0.1:1234/v1',

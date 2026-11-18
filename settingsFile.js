@@ -3,8 +3,11 @@
 // writes them as localStorage entries, so the page gets them from the files at startup and every
 // change it makes is written back. globalState keeps a mirror of the entries, shared by every
 // window: it holds the entries that aren't settings and starts the files on a machine without them.
+// With host.settings_sync on (the default), VS Code Settings Sync carries the mirror to the user's
+// other machines, and settings and keybindings that arrive that way are written into the files.
 
 const vscode = require('vscode');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { isDeepStrictEqual } = require('util');
@@ -18,6 +21,14 @@ const SETTINGS_MAP = require('./media/settings-map.json');
 // localStorage key our Warp build keeps keybindings.yaml's text under (app/src/keyboard.rs), as a
 // JSON string
 const KEYBINDINGS_KEY = 'CustomKeybindings';
+// Each machine keeps its own choice of whether to sync, so this one never comes from the mirror
+const SETTINGS_SYNC_KEY = 'HostSettingsSync';
+// Kept in the mirror next to the entries (never handed to the page): which machine last changed its
+// settings or keybindings, and an id for that change. In the same globalState value, so Settings
+// Sync carries both together.
+const SYNC_META_KEY = '__panelwarpSync';
+/** Ids of changes from other machines remembered as applied. */
+const MAX_APPLIED_SYNC_IDS = 50;
 
 const KEYBINDINGS_HEADER = `# Warp panel keybindings (same format as desktop Warp's ~/.warp/keybindings.yaml).
 # Each line maps an action to its keys, or to none to unbind it, e.g.
@@ -68,9 +79,11 @@ const HEADER = `# Warp panel settings (same format as desktop Warp's ~/.warp/set
 # Only settings you've changed are listed. Removing a setting resets it to its default. Comments
 # other than this header are dropped when Warp writes a change.
 #
-# This file stays on this machine: VS Code Settings Sync only carries command history, and only with
-# host.history_sync = true, which syncs your newest 500 commands to your other machines (commands
-# starting with a space are left out).
+# host.settings_sync = true (the default) syncs this file's settings and your keybindings to your
+# other machines through VS Code Settings Sync; set it to false to keep them on this machine. Each
+# machine keeps its own host.settings_sync, and turning private routing off still asks on each one.
+# host.history_sync = true also syncs your newest 500 commands (commands starting with a space are
+# left out).
 # [host.ai]: models are OpenRouter model ids; expanded_model = "" means fast suggestions only;
 # expanded_effort is minimal, low, medium or high; recent_commands_in_context only applies while
 # private_routing is on. After a failed command the fast model suggests a fix; next_command = true
@@ -89,6 +102,44 @@ ${TOML.stringify(panelDefaults)
   .map((line) => `# ${line}`.trimEnd())
   .join('\n')}
 `;
+
+// The comment line that ends the header's text before the commented panel defaults
+const DEFAULTS_INTRO = '# this comment.\n';
+
+/**
+ * A panel default edited inside the header's comment (e.g. "# history_sync = true") is easy to
+ * mistake for a setting. Returns the text with each one that differs from its default, and that the
+ * file doesn't set itself, moved into the settings, and the header restored; null if there's none.
+ */
+function promoteEditedDefaults(text) {
+  const intro = text.indexOf(DEFAULTS_INTRO);
+  if (intro === -1) return null;
+  const lines = text.slice(intro + DEFAULTS_INTRO.length).split('\n');
+  const commented = [];
+  for (const line of lines) {
+    if (!line.startsWith('#')) break;
+    commented.push(line.replace(/^# ?/, ''));
+  }
+  let block;
+  let doc;
+  try {
+    block = TOML.parse(commented.join('\n'));
+    doc = TOML.parse(text);
+  } catch {
+    return null;
+  }
+  const promoted = [];
+  for (const [storageKey, value] of Object.entries(DEFAULTS)) {
+    const tomlPath = SETTINGS_MAP[storageKey];
+    const edited = getPath(block, tomlPath);
+    if (edited === undefined || getPath(doc, tomlPath) !== undefined) continue;
+    if (isDeepStrictEqual(JSON.parse(JSON.stringify(edited)), value)) continue;
+    setPath(doc, tomlPath, edited);
+    promoted.push(tomlPath);
+  }
+  if (!promoted.length) return null;
+  return { text: HEADER + '\n' + TOML.stringify(doc), promoted };
+}
 
 /** Renders the mirrored localStorage entries as settings.toml text. */
 function renderToml(entries) {
@@ -174,6 +225,25 @@ function read(file) {
 const isPrivateRouting = (entries) =>
   entries.HostAiPrivateRouting === undefined || decode(entries.HostAiPrivateRouting) !== false;
 
+/** The entries Settings Sync carries between machines' files: settings and keybindings. */
+function syncedEntries(entries) {
+  const synced = {};
+  for (const [key, value] of Object.entries(entries)) {
+    if ((key in SETTINGS_MAP && key !== SETTINGS_SYNC_KEY) || key === KEYBINDINGS_KEY) synced[key] = value;
+  }
+  return synced;
+}
+
+/** Whether two entries hold the same value, also when their text differs (13 and 13.0). */
+function sameEntry(a, b) {
+  if (a === b) return true;
+  try {
+    return holds(a, decode(b));
+  } catch {
+    return false;
+  }
+}
+
 /** Entries that differ between two sets, as changes (null for removed). */
 function changedEntries(previous, next) {
   const changes = {};
@@ -201,7 +271,7 @@ class SettingsFile {
     // from the files once they're loaded. Each window compares the files against its own entries,
     // since the mirror is shared with windows on other machines (remote windows) and changes
     // between them in any order.
-    this.state = this.globalState.get(storageKey, {});
+    this.state = this.mirrorEntries();
     this.pendingChanges = new Set();
     // Set while the files turn private routing off and nothing has asked about it yet
     this.routingPending = false;
@@ -210,6 +280,10 @@ class SettingsFile {
     this.keybindingsFile = path.join(dir, 'keybindings.yaml');
     // Markers kept next to the files, so they're per machine like the files
     this.migratedFile = path.join(dir, '.settings-migrated');
+    // This machine's id in the mirror's sync stamp, and the changes from other machines it applied.
+    // In the storage folder, so a remote window's machine (SSH, WSL, containers) has its own.
+    this.syncIdFile = path.join(dir, '.settings-sync-id');
+    this.syncAppliedFile = path.join(dir, '.settings-sync-applied.json');
     this.routingAllowedFile = path.join(dir, '.private-routing-off-allowed');
     context.subscriptions.push(
       vscode.workspace.onDidSaveTextDocument((doc) => {
@@ -246,7 +320,8 @@ class SettingsFile {
    */
   async migrate() {
     if (fs.existsSync(this.migratedFile)) return;
-    const mirror = this.globalState.get(this.storageKey, {});
+    // Another machine's choice of syncing, if the mirror came from Settings Sync, isn't this one's
+    const { [SETTINGS_SYNC_KEY]: _otherMachine, ...mirror } = this.mirrorEntries();
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const replace = (file, text) => {
       const existing = read(file);
@@ -259,6 +334,9 @@ class SettingsFile {
     }
     // Routing off in the mirror was confirmed when it was turned off
     this.setRoutingOffAllowed(!isPrivateRouting(mirror));
+    // The files now hold the mirror's settings, including any that came from another machine
+    const meta = this.globalState.get(this.storageKey, {})[SYNC_META_KEY];
+    this.writeAppliedSyncIds(typeof meta?.id === 'string' ? [meta.id] : []);
     fs.writeFileSync(this.migratedFile, '');
     this.log.appendLine('moved settings into settings.toml');
   }
@@ -273,9 +351,11 @@ class SettingsFile {
   async sync(confirm, base) {
     // Until migrate() succeeds the file may be stale, and the mirror holds the settings
     if (!fs.existsSync(this.migratedFile)) {
-      this.state = this.globalState.get(this.storageKey, {});
+      this.state = this.mirrorEntries();
       return { changes: {}, errors: [] };
     }
+    this.pullSynced();
+    this.promoteEditedDefaults();
     let errors;
     let settingsReadable;
     const fromFiles = () => {
@@ -323,19 +403,117 @@ class SettingsFile {
     return { changes, errors };
   }
 
+  /** Moves panel defaults edited inside settings.toml's header comment into its settings. */
+  promoteEditedDefaults() {
+    let result;
+    try {
+      result = promoteEditedDefaults(read(this.file));
+      if (result) fs.writeFileSync(this.file, result.text);
+    } catch (error) {
+      this.log.appendLine(`settings.toml: ${error.message}`);
+      return;
+    }
+    if (!result) return;
+    const names = result.promoted.join(', ');
+    this.log.appendLine(`settings.toml: applied ${names} from the header comment`);
+    vscode.window.showInformationMessage(
+      `Warp applied ${names} from the comment in settings.toml and moved ${
+        result.promoted.length === 1 ? 'it' : 'them'
+      } out of the comment.`,
+    );
+  }
+
   /** Records whether private routing may be off on this machine. */
   setRoutingOffAllowed(allowed) {
     if (allowed) fs.writeFileSync(this.routingAllowedFile, '');
     else fs.rmSync(this.routingAllowedFile, { force: true });
   }
 
-  /** Writes changed entries (null for removed) into the mirror every window shares. */
+  /** The mirror's entries, without its sync stamp. */
+  mirrorEntries() {
+    const { [SYNC_META_KEY]: _meta, ...entries } = this.globalState.get(this.storageKey, {});
+    return entries;
+  }
+
+  /**
+   * With host.settings_sync on in this machine's settings.toml, writes the settings and keybindings
+   * another machine put in the mirror (through VS Code Settings Sync) into the files, once per
+   * change. The mirror holds one machine's whole set, so the files take it as a whole: settings it
+   * leaves out go back to their defaults, and settings.toml keys the panel doesn't know stay.
+   * Turning private routing off this way still asks on this machine (see sync). Only the stamp
+   * decides what came from elsewhere, so a window that sees the mirror a little late can't write
+   * an older value back.
+   */
+  pullSynced() {
+    try {
+      const settingsText = read(this.file);
+      if (getPath(TOML.parse(settingsText), 'host.settings_sync') === false) return;
+      const mirror = this.globalState.get(this.storageKey, {});
+      const meta = mirror[SYNC_META_KEY];
+      if (typeof meta?.id !== 'string' || meta.from === this.syncId()) return;
+      const applied = this.readAppliedSyncIds();
+      if (applied.includes(meta.id)) return;
+      const remote = syncedEntries(mirror);
+      const local = syncedEntries(withKeybindings(applyToml(settingsText, {}), read(this.keybindingsFile)));
+      const changes = {};
+      for (const key of new Set([...Object.keys(local), ...Object.keys(remote)])) {
+        if (!(key in remote)) changes[key] = null;
+        else if (!(key in local) || !sameEntry(local[key], remote[key])) changes[key] = remote[key];
+      }
+      if (KEYBINDINGS_KEY in changes) {
+        const yaml = changes[KEYBINDINGS_KEY];
+        fs.writeFileSync(this.keybindingsFile, yaml === null ? '' : JSON.parse(yaml));
+      }
+      if (Object.keys(changes).some((key) => key in SETTINGS_MAP)) {
+        fs.writeFileSync(this.file, updateToml(settingsText, changes));
+      }
+      this.writeAppliedSyncIds([...applied, meta.id].slice(-MAX_APPLIED_SYNC_IDS));
+      if (Object.keys(changes).length) {
+        this.log.appendLine(`settings sync: applied ${Object.keys(changes).join(', ')} from another machine`);
+      }
+    } catch (error) {
+      // E.g. settings.toml doesn't parse: sync() reports that, and this runs again once it does
+      this.log.appendLine(`settings sync: couldn't apply another machine's settings: ${error.message}`);
+    }
+  }
+
+  /** This machine's id for the mirror's sync stamp. */
+  syncId() {
+    try {
+      return fs.readFileSync(this.syncIdFile, 'utf8').trim();
+    } catch {
+      const id = crypto.randomUUID();
+      fs.writeFileSync(this.syncIdFile, id);
+      return id;
+    }
+  }
+
+  readAppliedSyncIds() {
+    try {
+      const ids = JSON.parse(fs.readFileSync(this.syncAppliedFile, 'utf8'));
+      return Array.isArray(ids) ? ids : [];
+    } catch {
+      return [];
+    }
+  }
+
+  writeAppliedSyncIds(ids) {
+    fs.writeFileSync(this.syncAppliedFile, JSON.stringify(ids));
+  }
+
+  /**
+   * Writes changed entries (null for removed) into the mirror every window shares. A change to
+   * settings or keybindings stamps the mirror as this machine's; callers take in what another
+   * machine synced first (pullSynced), so that isn't lost.
+   */
   async updateMirror(changes) {
+    const stamp = Object.keys(syncedEntries(changes)).length > 0 && fs.existsSync(this.migratedFile);
     const mirror = { ...this.globalState.get(this.storageKey, {}) };
     for (const [key, value] of Object.entries(changes)) {
       if (value === null) delete mirror[key];
       else mirror[key] = value;
     }
+    if (stamp) mirror[SYNC_META_KEY] = { from: this.syncId(), id: crypto.randomUUID() };
     await this.globalState.update(this.storageKey, mirror);
   }
 
@@ -346,7 +524,7 @@ class SettingsFile {
    */
   async load() {
     try {
-      const { errors } = await this.sync(false, this.globalState.get(this.storageKey, {}));
+      const { errors } = await this.sync(false, this.mirrorEntries());
       if (errors.length) vscode.window.showErrorMessage(`Warp couldn't read its settings: ${errors.join('; ')}`);
     } catch (error) {
       vscode.window.showErrorMessage(`Warp couldn't read its settings: ${error.message}`);
@@ -368,6 +546,9 @@ class SettingsFile {
     // The files before the mirror's await, so a watcher sync in between can't read the old file
     // against the new entries
     if (fs.existsSync(this.migratedFile)) {
+      // Another machine's synced settings go into the files first, so this change lands on top of
+      // them (the watcher hands the rest to the page)
+      this.pullSynced();
       try {
         // Warp's settings page asks before it turns private routing off. Allowing it is recorded
         // after the file, so another window that read the old file can't remove it (the watcher
@@ -460,4 +641,4 @@ class SettingsFile {
   }
 }
 
-module.exports = { SettingsFile, renderToml, applyToml, updateToml };
+module.exports = { SettingsFile, renderToml, applyToml, updateToml, promoteEditedDefaults };

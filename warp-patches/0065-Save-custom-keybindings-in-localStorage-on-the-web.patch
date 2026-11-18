@@ -1,7 +1,7 @@
-From 8040fa0c66112ad31bd008cab60ca05c3f0d07e2 Mon Sep 17 00:00:00 2001
+From 3aecb7a051d16e9a7d732a8cedf2384344f8cb49 Mon Sep 17 00:00:00 2001
 From: Alex Brodsky <122503996+Albro3459@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 12:23:13 -0600
-Subject: [PATCH] Save custom keybindings in localStorage on the web
+Subject: [PATCH 65/74] Save custom keybindings in localStorage on the web
 
 The web build never saved keybindings: save_custom_keybindings only
 logged "TODO(wasm)", and the read side opened keybindings.yaml from a
@@ -20,7 +20,7 @@ choice is stored and still applies after a page reload.
  1 file changed, 36 insertions(+), 7 deletions(-)
 
 diff --git a/app/src/keyboard.rs b/app/src/keyboard.rs
-index e4a7ff467..b638e366d 100644
+index e4a7ff4..b638e36 100644
 --- a/app/src/keyboard.rs
 +++ b/app/src/keyboard.rs
 @@ -9,6 +9,8 @@ use warpui::AppContext;

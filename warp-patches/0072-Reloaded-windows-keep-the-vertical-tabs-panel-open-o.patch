@@ -1,0 +1,29 @@
+From 40aea1dcc1b43eed7e1c354e4c2a8188227ed6e3 Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Wed, 18 Nov 2026 11:57:20 +0100
+Subject: [PATCH 72/74] Reloaded windows keep the vertical tabs panel open or
+ closed in embedded builds
+
+Embedded builds opened the panel in every restored window, so reloading a VS Code window reopened a panel the user had closed. New windows still open it (nothing to restore), and a reloaded window keeps the state it saved. The Appearance setting can still open it in restored windows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/workspace/tab_settings.rs | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/workspace/tab_settings.rs b/app/src/workspace/tab_settings.rs
+index 3255c0b..971ab9a 100644
+--- a/app/src/workspace/tab_settings.rs
++++ b/app/src/workspace/tab_settings.rs
+@@ -510,8 +510,9 @@ define_settings_group!(TabSettings, settings: [
+     },
+     show_vertical_tab_panel_in_restored_windows: ShowVerticalTabPanelInRestoredWindows {
+         type: bool,
+-        // On by default when embedded in a host app (e.g. the VS Code panel).
+-        default: cfg!(feature = "remote_tty"),
++        // Off in embedded builds too: a new window opens the panel anyway (nothing to restore), and a
++        // reloaded window should keep the panel as the user left it.
++        default: false,
+         supported_platforms: SupportedPlatforms::ALL,
+         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+         surface: settings::SettingSurfaces::GUI,

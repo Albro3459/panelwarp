@@ -1,7 +1,8 @@
-From a0194bbc6212c7d8e3d0802c6c5b568b7eaee9ad Mon Sep 17 00:00:00 2001
+From 290a4532110046b91bc05c9ef194a80c56f20828 Mon Sep 17 00:00:00 2001
 From: "Tianyu (Sky) Lu" <tianyu@lu.fm>
 Date: Wed, 28 Oct 2026 17:24:55 -0400
-Subject: [PATCH] Fix Tab key behavior always detected as user defined (#16529)
+Subject: [PATCH 67/74] Fix Tab key behavior always detected as user defined
+ (#16529)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -120,7 +121,7 @@ CHANGELOG-NONE
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/app/src/settings_view/features_page.rs b/app/src/settings_view/features_page.rs
-index cf75a3a77..27de398fb 100644
+index cf75a3a..27de398 100644
 --- a/app/src/settings_view/features_page.rs
 +++ b/app/src/settings_view/features_page.rs
 @@ -3631,9 +3631,9 @@ impl FeaturesPageView {

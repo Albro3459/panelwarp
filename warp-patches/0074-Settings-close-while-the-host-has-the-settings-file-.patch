@@ -1,0 +1,302 @@
+From 915430cb7125b4d7378d86030776322f756de845 Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <acc@felkru.com>
+Date: Wed, 18 Nov 2026 12:07:13 +0100
+Subject: [PATCH 74/74] Settings close while the host has the settings file
+ open
+
+The host calls window.warpPanelCloseSettings() when it opens settings.toml or keybindings.yaml, which closes the settings tab. While the file stays open, opening settings asks the host (warpPanelSettingsFileOpen / warpPanelRequestSettings) to close the file first; the host then reopens settings at the requested page with window.warpPanelOpenSettingsPage(slug), so settings always show what the file says. The too-narrow settings message gets an Open settings file button at the bottom center.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/lib.rs                                |  2 +
+ app/src/platform/wasm.rs                      | 85 +++++++++++++++++++
+ app/src/settings_view/mod.rs                  | 85 +++++++++++--------
+ app/src/settings_view/settings_file_footer.rs |  3 +
+ app/src/workspace/view.rs                     | 26 ++++++
+ 5 files changed, 165 insertions(+), 36 deletions(-)
+
+diff --git a/app/src/lib.rs b/app/src/lib.rs
+index fe81ff7..6d4d65c 100644
+--- a/app/src/lib.rs
++++ b/app/src/lib.rs
+@@ -2093,6 +2093,8 @@ pub(crate) fn initialize_app(
+     ctx.add_singleton_model(crate::platform::wasm::host_session::Autosave::new);
+     #[cfg(all(target_family = "wasm", feature = "remote_tty"))]
+     ctx.add_singleton_model(crate::platform::wasm::host_settings::Reload::new);
++    #[cfg(all(target_family = "wasm", feature = "remote_tty"))]
++    ctx.add_singleton_model(crate::platform::wasm::host_settings::PaneHooks::new);
+ 
+     ctx.add_singleton_model(CustomSecretRegexUpdater::new);
+ 
+diff --git a/app/src/platform/wasm.rs b/app/src/platform/wasm.rs
+index 46c172b..cc6ba42 100644
+--- a/app/src/platform/wasm.rs
++++ b/app/src/platform/wasm.rs
+@@ -33,6 +33,12 @@ mod ffi {
+         #[wasm_bindgen(js_name = "warpPanelOpenKeybindingsFile", catch)]
+         pub fn open_keybindings_file_in_host() -> Result<(), JsValue>;
+ 
++        #[wasm_bindgen(js_name = "warpPanelSettingsFileOpen", catch)]
++        pub fn settings_file_open() -> Result<bool, JsValue>;
++
++        #[wasm_bindgen(js_name = "warpPanelRequestSettings", catch)]
++        pub fn request_settings(page: &str) -> Result<(), JsValue>;
++
+         #[wasm_bindgen(js_name = "warpPanelStoreApiKey", catch)]
+         pub fn store_api_key(provider: &str, key: &str) -> Result<(), JsValue>;
+ 
+@@ -372,6 +378,17 @@ pub fn open_keybindings_file_in_host() -> bool {
+     ffi::open_keybindings_file_in_host().is_ok()
+ }
+ 
++/// Whether the host has its settings or keybindings file open in an editor. If so, it asks the
++/// user to close the file and then reopens settings at `page` (a [`SettingsSection`] slug), so
++/// settings always open showing what the file says. Returns true if the host took over.
++///
++/// [`SettingsSection`]: crate::settings_view::SettingsSection
++pub fn settings_pane_held_by_host(page: Option<&str>) -> bool {
++    host_has_function("warpPanelSettingsFileOpen")
++        && matches!(ffi::settings_file_open(), Ok(true))
++        && ffi::request_settings(page.unwrap_or_default()).is_ok()
++}
++
+ /// Whether the host page defines `window[name]` as a function, for UI that only works with
+ /// that hook.
+ pub fn host_has_function(name: &str) -> bool {
+@@ -949,4 +966,72 @@ pub mod host_settings {
+     }
+ 
+     impl warpui::SingletonEntity for Reload {}
++
++    /// `window.warpPanelCloseSettings()` closes the settings tab, which the host calls when it
++    /// opens the settings file, and `window.warpPanelOpenSettingsPage(slug)` reopens it once the
++    /// file is closed.
++    pub struct PaneHooks;
++
++    enum PaneRequest {
++        Close,
++        Open(String),
++    }
++
++    impl PaneHooks {
++        pub fn new(ctx: &mut warpui::ModelContext<Self>) -> Self {
++            let (tx, rx) = futures::channel::mpsc::unbounded::<PaneRequest>();
++            let close_tx = tx.clone();
++            let close = Closure::<dyn Fn()>::new(move || {
++                let _ = close_tx.unbounded_send(PaneRequest::Close);
++            });
++            let open = Closure::<dyn Fn(Option<String>)>::new(move |slug: Option<String>| {
++                let _ = tx.unbounded_send(PaneRequest::Open(slug.unwrap_or_default()));
++            });
++            let window = gloo::utils::window();
++            let _ = js_sys::Reflect::set(&window, &"warpPanelCloseSettings".into(), close.as_ref());
++            let _ = js_sys::Reflect::set(
++                &window,
++                &"warpPanelOpenSettingsPage".into(),
++                open.as_ref(),
++            );
++            // The hooks live for the lifetime of the page.
++            close.forget();
++            open.forget();
++            ctx.spawn_stream_local(
++                rx,
++                |_, request, ctx| {
++                    let workspaces = crate::workspace::WorkspaceRegistry::as_ref(ctx).all_workspaces(ctx);
++                    match request {
++                        PaneRequest::Close => {
++                            for (_, workspace) in workspaces {
++                                workspace.update(ctx, |workspace, ctx| {
++                                    workspace.close_settings_pane(ctx)
++                                });
++                            }
++                        }
++                        PaneRequest::Open(slug) => {
++                            let active = ctx.windows().active_window();
++                            let workspace = workspaces
++                                .iter()
++                                .find(|(window_id, _)| Some(*window_id) == active)
++                                .or(workspaces.first());
++                            if let Some((_, workspace)) = workspace {
++                                workspace.update(ctx, |workspace, ctx| {
++                                    workspace.open_settings_pane_from_host(&slug, ctx)
++                                });
++                            }
++                        }
++                    }
++                },
++                |_, _| {},
++            );
++            Self
++        }
++    }
++
++    impl warpui::Entity for PaneHooks {
++        type Event = ();
++    }
++
++    impl warpui::SingletonEntity for PaneHooks {}
+ }
+diff --git a/app/src/settings_view/mod.rs b/app/src/settings_view/mod.rs
+index 2fbbe17..5053dcf 100644
+--- a/app/src/settings_view/mod.rs
++++ b/app/src/settings_view/mod.rs
+@@ -2481,44 +2481,57 @@ impl SettingsView {
+ 
+     /// Shown instead of the settings in embedded builds when the panel is narrower than
+     /// [`MIN_SETTINGS_WIDTH_EMBEDDED`].
+-    fn render_too_narrow(appearance: &Appearance) -> Box<dyn Element> {
++    fn render_too_narrow(&self, appearance: &Appearance) -> Box<dyn Element> {
+         let theme = appearance.theme();
+-        Align::new(
+-            Container::new(
+-                Flex::column()
+-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+-                    .with_children([
+-                        Text::new(
+-                            "Make the Warp panel wider to use settings",
+-                            appearance.ui_font_family(),
+-                            appearance.ui_font_size() + 2.,
+-                        )
+-                        .with_style(Properties::default().weight(Weight::Semibold))
+-                        .with_color(theme.active_ui_text_color().into_solid())
+-                        .finish(),
+-                        Container::new(
+-                            Text::new(
+-                                format!(
+-                                    "Settings need the panel to be at least {} px wide. Drag the \
+-                                     panel's edge, maximize the panel, or move Warp to the editor \
+-                                     area. To change settings without widening it, run \"Warp: Open \
+-                                     Settings File\" from VS Code's Command Palette.",
+-                                    MIN_SETTINGS_WIDTH_EMBEDDED as u32
+-                                ),
+-                                appearance.ui_font_family(),
+-                                appearance.ui_font_size(),
+-                            )
+-                            .with_color(theme.sub_text_color(theme.background()).into_solid())
+-                            .finish(),
+-                        )
+-                        .with_margin_top(8.)
+-                        .finish(),
+-                    ])
++        let message = Flex::column()
++            .with_cross_axis_alignment(CrossAxisAlignment::Center)
++            .with_children([
++                Text::new(
++                    "Make the Warp panel wider to use settings",
++                    appearance.ui_font_family(),
++                    appearance.ui_font_size() + 2.,
++                )
++                .with_style(Properties::default().weight(Weight::Semibold))
++                .with_color(theme.active_ui_text_color().into_solid())
++                .finish(),
++                Container::new(
++                    Text::new(
++                        format!(
++                            "Settings need the panel to be at least {} px wide. Drag the \
++                             panel's edge, maximize the panel, or move Warp to the editor \
++                             area. To change settings without widening it, open the settings \
++                             file below.",
++                            MIN_SETTINGS_WIDTH_EMBEDDED as u32
++                        ),
++                        appearance.ui_font_family(),
++                        appearance.ui_font_size(),
++                    )
++                    .with_color(theme.sub_text_color(theme.background()).into_solid())
+                     .finish(),
+-            )
+-            .with_uniform_padding(24.)
+-            .finish(),
++                )
++                .with_margin_top(8.)
++                .finish(),
++            ])
++            .finish();
++        let button = ConstrainedBox::new(settings_file_footer::render_open_settings_file_button(
++            appearance,
++            self.footer_mouse_states
++                .too_narrow_open_settings_file_button
++                .clone(),
++        ))
++        .with_width(200.)
++        .finish();
++        Container::new(
++            Flex::column()
++                .with_main_axis_size(MainAxisSize::Max)
++                .with_cross_axis_alignment(CrossAxisAlignment::Center)
++                .with_children([
++                    Expanded::new(1., Align::new(message).finish()).finish(),
++                    Container::new(button).with_margin_top(16.).finish(),
++                ])
++                .finish(),
+         )
++        .with_uniform_padding(24.)
+         .finish()
+     }
+ 
+@@ -2756,7 +2769,7 @@ impl View for SettingsView {
+                 row,
+                 vec![(
+                     SizeConstraintCondition::WidthLessThan(MIN_SETTINGS_WIDTH_EMBEDDED),
+-                    Self::render_too_narrow(appearance),
++                    self.render_too_narrow(appearance),
+                 )],
+             )
+             .finish()
+diff --git a/app/src/settings_view/settings_file_footer.rs b/app/src/settings_view/settings_file_footer.rs
+index 3e0aee8..46f553f 100644
+--- a/app/src/settings_view/settings_file_footer.rs
++++ b/app/src/settings_view/settings_file_footer.rs
+@@ -88,6 +88,9 @@ pub struct SettingsFooterMouseStates {
+     pub open_settings_file_button: MouseStateHandle,
+     pub alert_open_file_button: MouseStateHandle,
+     pub alert_fix_with_oz_button: MouseStateHandle,
++    /// The "Open settings file" button shown while the embedded panel is too narrow for
++    /// settings.
++    pub too_narrow_open_settings_file_button: MouseStateHandle,
+     /// Scroll state for the error alert's text region (heading +
+     /// description), so scroll position survives renders.
+     pub alert_text_scroll_state: ClippedScrollStateHandle,
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 23eaaed..d40dba0 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -8898,6 +8898,13 @@ impl Workspace {
+         search_query: Option<&str>,
+         ctx: &mut ViewContext<Self>,
+     ) {
++        // While the host has the settings file open, settings would show values the file is
++        // about to replace, so the host asks to close the file and reopens settings at `page`.
++        #[cfg(target_family = "wasm")]
++        if crate::platform::wasm::settings_pane_held_by_host(page.map(|page| page.slug())) {
++            return;
++        }
++
+         // Ensure there is only one settings pane per window
+         let settings_pane_manager = SettingsPaneManager::handle(ctx);
+         if let Some(locator) = settings_pane_manager.as_ref(ctx).find_pane(ctx.window_id()) {
+@@ -8946,6 +8953,25 @@ impl Workspace {
+         );
+     }
+ 
++    /// Closes this window's settings tab, for the host when it opens the settings file.
++    #[cfg(target_family = "wasm")]
++    pub fn close_settings_pane(&mut self, ctx: &mut ViewContext<Self>) {
++        let locator = SettingsPaneManager::handle(ctx)
++            .as_ref(ctx)
++            .find_pane(ctx.window_id());
++        if let Some(locator) = locator {
++            self.close_pane(locator.pane_group_id, locator.pane_id, ctx);
++        }
++    }
++
++    /// Opens settings at the page with `slug` (or the default page), for the host after it
++    /// closed the settings file.
++    #[cfg(target_family = "wasm")]
++    pub fn open_settings_pane_from_host(&mut self, slug: &str, ctx: &mut ViewContext<Self>) {
++        self.close_all_overlays(ctx);
++        self.open_settings_pane(SettingsSection::from_slug(slug), None, ctx);
++    }
++
+     /// Open a file from the given session as a notebook pane.
+     #[cfg(feature = "local_fs")]
+     fn open_file_notebook(

@@ -110,6 +110,8 @@ async function fixture(t, { mirror = {}, dir, live = true, watch = false, reload
     settings, page, errors, confirmations, reloadPrompts,
     get reloads() { return reloads; },
     get mirror() { return entries; },
+    // VS Code Settings Sync replaces the whole mirror with another machine's
+    receiveSync: (mirror) => { entries = mirror; },
     allowRouting: () => { allowRouting = true; },
     chooseReload: () => { reload = true; },
     nextChange: () => new Promise((resolve) => waiting.push(resolve)),
@@ -332,4 +334,128 @@ test('a delayed file update cannot undo turning private routing back on', async 
   assert.equal(f.page.HostAiPrivateRouting, '"true"');
   assert.equal(fs.existsSync(f.settings.routingAllowedFile), false);
   assert.equal(TOML.parse(fs.readFileSync(f.settings.file, 'utf8')).host.ai.private_routing, true);
+});
+
+// The mirror as another machine leaves it after changing its settings
+function otherMachine(entries, id = 'change-1') {
+  return { ...entries, __panelwarpSync: { from: 'other-machine', id } };
+}
+
+const fontSize = (f) => TOML.parse(fs.readFileSync(f.settings.file, 'utf8')).appearance?.text?.font_size;
+
+test("another machine's synced settings and keybindings reach the files and the page", async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"', TabTitle: '"x"' } });
+  f.receiveSync(otherMachine({ FontSize: '"15"', CustomKeybindings: JSON.stringify(newBindings), TabTitle: '"x"' }));
+  await f.settings.apply(false);
+  assert.equal(fontSize(f), 15);
+  assert.equal(fs.readFileSync(f.settings.keybindingsFile, 'utf8'), newBindings);
+  assert.equal(f.page.FontSize, '"15"');
+  assert.equal(f.page.CustomKeybindings, JSON.stringify(newBindings));
+  assert.equal('__panelwarpSync' in f.page, false);
+  assert.equal('__panelwarpSync' in (await f.settings.load()), false);
+});
+
+test('a synced change applies once, so a late window or a later local edit keeps the newer value', async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' } });
+  const synced = otherMachine({ FontSize: '"15"' });
+  f.receiveSync(synced);
+  await f.settings.apply(false);
+  fs.writeFileSync(f.settings.file, '[appearance.text]\nfont_size = 17\n');
+  await f.settings.apply(false);
+  // A window that sees the mirror late still has the other machine's change
+  f.receiveSync(synced);
+  await f.settings.apply(false);
+  assert.equal(fontSize(f), 17);
+  assert.equal(f.page.FontSize, '"17"');
+});
+
+test("this machine's changes are stamped as its own and aren't pulled back", async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' } });
+  await f.settings.save({ FontSize: '"16"' });
+  const stamp = f.mirror.__panelwarpSync;
+  assert.equal(stamp.from, fs.readFileSync(f.settings.syncIdFile, 'utf8'));
+  fs.writeFileSync(f.settings.file, '[appearance.text]\nfont_size = 18\n');
+  await f.settings.apply(false);
+  assert.equal(fontSize(f), 18);
+  assert.notEqual(f.mirror.__panelwarpSync.id, stamp.id);
+  assert.equal(f.mirror.FontSize, encodeNumber(18));
+});
+
+test('a Warp change made before a pending sync is applied lands on top of it', async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' } });
+  f.receiveSync(otherMachine({ FontSize: '"15"', CustomKeybindings: JSON.stringify(newBindings) }));
+  await f.settings.save({ FontSize: '"16"' });
+  assert.equal(fontSize(f), 16);
+  assert.equal(fs.readFileSync(f.settings.keybindingsFile, 'utf8'), newBindings);
+  assert.equal(f.mirror.FontSize, '"16"');
+  assert.equal(f.mirror.CustomKeybindings, JSON.stringify(newBindings));
+});
+
+test("with settings sync off, another machine's settings are left out", async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' } });
+  fs.writeFileSync(f.settings.file, '[host]\nsettings_sync = false\n\n[appearance.text]\nfont_size = 14\n');
+  await f.settings.apply(false);
+  f.receiveSync(otherMachine({ FontSize: '"15"' }));
+  await f.settings.apply(false);
+  assert.equal(fontSize(f), 14);
+  assert.equal(f.page.FontSize, '"14"');
+});
+
+test("another machine's choice of syncing doesn't change this one's", async (t) => {
+  const f = await fixture(t, { mirror: { FontSize: '"13"' } });
+  f.receiveSync(otherMachine({ FontSize: '"15"', HostSettingsSync: '"false"' }));
+  await f.settings.apply(false);
+  assert.equal(fontSize(f), 15);
+  assert.equal(TOML.parse(fs.readFileSync(f.settings.file, 'utf8')).host?.settings_sync, undefined);
+  assert.equal(f.page.HostSettingsSync, undefined);
+});
+
+test('private routing turned off on another machine still asks on this one', async (t) => {
+  const f = await fixture(t);
+  f.receiveSync(otherMachine({ HostAiPrivateRouting: '"false"' }));
+  await f.settings.apply(false);
+  assert.equal(f.page.HostAiPrivateRouting, '"true"');
+  assert.equal(f.confirmations.length, 0);
+  f.settings.confirmRouting();
+  await f.settings.apply(true);
+  assert.equal(f.confirmations.length, 1);
+  assert.equal(f.page.HostAiPrivateRouting, '"true"');
+  assert.equal(TOML.parse(fs.readFileSync(f.settings.file, 'utf8')).host.ai.private_routing, true);
+});
+
+test("a new machine's files start from the synced mirror without its sync choice", async (t) => {
+  const f = await fixture(t, { mirror: otherMachine({ FontSize: '"15"', HostSettingsSync: '"false"' }) });
+  assert.equal(fontSize(f), 15);
+  assert.equal(TOML.parse(fs.readFileSync(f.settings.file, 'utf8')).host?.settings_sync, undefined);
+  assert.equal('__panelwarpSync' in f.settings.state, false);
+  // Migrating counts as applying the mirror's change
+  await f.settings.apply(false);
+  assert.equal(fontSize(f), 15);
+});
+
+function encodeNumber(n) {
+  return JSON.stringify(JSON.stringify(n));
+}
+
+test('a panel default edited inside the header comment applies and moves out of it', async (t) => {
+  const f = await fixture(t);
+  const text = fs.readFileSync(f.settings.file, 'utf8');
+  assert.match(text, /^# history_sync = false$/m);
+  fs.writeFileSync(f.settings.file, text.replace(/^# history_sync = false$/m, '# history_sync = true'));
+  await f.settings.apply(false);
+  assert.equal(f.page.HostHistorySync, '"true"');
+  const after = fs.readFileSync(f.settings.file, 'utf8');
+  assert.equal(TOML.parse(after).host.history_sync, true);
+  // The comment shows the default again
+  assert.match(after, /^# history_sync = false$/m);
+});
+
+test('the header comment does not override a setting the file sets', () => {
+  const { promoteEditedDefaults, renderToml } = loadSettings({});
+  assert.equal(promoteEditedDefaults(renderToml({})), null);
+  // An unedited header, or an edit to a setting set below it, changes nothing
+  const set = renderToml({}).replace(/^# history_sync = false$/m, '# history_sync = true') + '\n[host]\nhistory_sync = false\n';
+  assert.equal(promoteEditedDefaults(set), null);
+  // A broken comment block is left alone
+  assert.equal(promoteEditedDefaults(renderToml({}).replace('# [host]', '# [host')), null);
 });

@@ -1,0 +1,96 @@
+From fd581ba910162a470700ed56f8abb52ac7f41e9f Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <acc@felkru.com>
+Date: Wed, 18 Nov 2026 12:07:13 +0100
+Subject: [PATCH 73/74] Vertical tabs show a globe for SSH sessions
+
+A tab whose shell runs on another machine (a Warpified SSH subshell, a session whose host differs from the pane's first shell, or a running plain ssh, mosh, autossh or et command) shows a globe instead of the terminal glyph, in the tab row and the detail sidecar.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/terminal/view.rs                | 33 +++++++++++++++++++++++++
+ app/src/workspace/view/vertical_tabs.rs | 13 +++++++---
+ 2 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/terminal/view.rs b/app/src/terminal/view.rs
+index b2e179d..b322567 100644
+--- a/app/src/terminal/view.rs
++++ b/app/src/terminal/view.rs
+@@ -26904,6 +26904,39 @@ impl TerminalView {
+         ctx.emit(Event::FileUploadFinished(exit_code))
+     }
+ 
++    /// Whether the pane's shell is on another machine over SSH: a Warpified SSH subshell, a
++    /// session whose host differs from the pane's first shell, or a running plain `ssh`
++    /// command. Used to mark the tab.
++    pub fn is_ssh_session(&self, app: &AppContext) -> bool {
++        let sessions = self.sessions.as_ref(app);
++        let model = self.model.lock();
++        let active_block = model.block_list().active_block();
++        if let Some(session) = active_block.session_id().and_then(|id| sessions.get(id)) {
++            if session
++                .subshell_info()
++                .as_ref()
++                .is_some_and(|info| info.ssh_connection_info.is_some())
++            {
++                return true;
++            }
++            #[cfg(not(feature = "local_fs"))]
++            if Self::is_on_other_host(session.hostname(), session.clone(), sessions) {
++                return true;
++            }
++        }
++        active_block.is_active_and_long_running()
++            && active_block
++                .command_to_string()
++                .split_whitespace()
++                .next()
++                .is_some_and(|program| {
++                    matches!(
++                        program.rsplit('/').next(),
++                        Some("ssh" | "mosh" | "autossh" | "et")
++                    )
++                })
++    }
++
+     fn ssh_session_info(&self, ctx: &ViewContext<Self>) -> Option<InteractiveSshCommand> {
+         let session = self
+             .active_block_session_id()
+diff --git a/app/src/workspace/view/vertical_tabs.rs b/app/src/workspace/view/vertical_tabs.rs
+index 38bf5be..b695f1b 100644
+--- a/app/src/workspace/view/vertical_tabs.rs
++++ b/app/src/workspace/view/vertical_tabs.rs
+@@ -1481,6 +1481,8 @@ fn render_detail_kind_badge_icon(
+                 // Local agent conversation: use the Warp agent logo glyph to
+                 // match the icon-with-status rendering for the tab row.
+                 WarpIcon::Agent
++            } else if terminal_view.is_ssh_session(app) {
++                WarpIcon::Globe
+             } else {
+                 WarpIcon::Terminal
+             };
+@@ -1490,7 +1492,7 @@ fn render_detail_kind_badge_icon(
+                 // sidecar context, so use the main text color to stay visible
+                 // on both dark and light themes.
+                 WarpIcon::Agent => theme.main_text_color(theme.background()),
+-                WarpIcon::Terminal => disabled_text,
++                WarpIcon::Terminal | WarpIcon::Globe => disabled_text,
+                 _ => sub_text,
+             };
+             icon.to_warpui_icon(color).finish()
+@@ -3353,9 +3355,14 @@ fn resolve_icon_with_status_variant(
+             match terminal_view_agent_icon_variant(terminal_view, app) {
+                 Some(variant) => variant,
+                 _ => {
+-                    // Plain terminal: use foreground color per design spec
++                    // Plain terminal: use foreground color per design spec. A globe marks a
++                    // shell on another machine over SSH.
+                     IconWithStatusVariant::Neutral {
+-                        icon: WarpIcon::Terminal,
++                        icon: if terminal_view.is_ssh_session(app) {
++                            WarpIcon::Globe
++                        } else {
++                            WarpIcon::Terminal
++                        },
+                         icon_color: main_text,
+                     }
+                 }
