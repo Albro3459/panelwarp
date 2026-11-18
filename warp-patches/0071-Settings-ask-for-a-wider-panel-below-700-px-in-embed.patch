@@ -1,0 +1,109 @@
+From ac01703a0285136fa69c6b385024274848dbe201 Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <hi@felkru.com>
+Date: Wed, 18 Nov 2026 11:22:14 +0100
+Subject: [PATCH 71/71] Settings ask for a wider panel below 700 px in embedded
+ builds
+
+Below the sidebar plus the page's designed 520 px minimum, settings rows overlap: labels run into their dropdowns and hints. Embedded builds now show "Make the Warp panel wider to use settings" there instead, with how to widen it and the Open Settings File command as the alternative.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/settings_view/mod.rs | 64 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/settings_view/mod.rs b/app/src/settings_view/mod.rs
+index 9030efa..2fbbe17 100644
+--- a/app/src/settings_view/mod.rs
++++ b/app/src/settings_view/mod.rs
+@@ -40,8 +40,8 @@ use warpui::elements::{
+     Align, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
+     ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty,
+     EventHandler, Expanded, Fill, Flex, MainAxisSize, OffsetPositioning, ParentAnchor,
+-    ParentElement, ParentOffsetBounds, Radius, SavePosition, ScrollbarWidth, Shrinkable, Stack,
+-    Text, Wrap,
++    ParentElement, ParentOffsetBounds, Radius, SavePosition, ScrollbarWidth, Shrinkable,
++    SizeConstraintCondition, SizeConstraintSwitch, Stack, Text, Wrap,
+ };
+ use warpui::fonts::{Properties, Weight};
+ use warpui::keymap::{ContextPredicate, EnabledPredicate, FixedBinding};
+@@ -157,6 +157,11 @@ const SIDEBAR_WIDTH_WITH_FOOTER: f32 = 248.;
+ /// Sidebar width in embedded (`remote_tty`) builds.
+ const SIDEBAR_WIDTH_EMBEDDED: f32 = 180.;
+ 
++/// Narrowest settings view embedded builds render: the sidebar plus the page's designed minimum
++/// width. Below it, rows overlap (labels run into their dropdowns and hints), so the view asks for
++/// a wider panel instead.
++const MIN_SETTINGS_WIDTH_EMBEDDED: f32 = SIDEBAR_WIDTH_EMBEDDED + 520.;
++
+ /// Returns the sidebar width, widened only when the settings-file footer
+ /// is enabled. This keeps the wider layout gated with the footer itself so
+ /// Preview/Stable users don't see an unexplained 48px width bump before
+@@ -2474,6 +2479,49 @@ impl SettingsView {
+         .finish()
+     }
+ 
++    /// Shown instead of the settings in embedded builds when the panel is narrower than
++    /// [`MIN_SETTINGS_WIDTH_EMBEDDED`].
++    fn render_too_narrow(appearance: &Appearance) -> Box<dyn Element> {
++        let theme = appearance.theme();
++        Align::new(
++            Container::new(
++                Flex::column()
++                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
++                    .with_children([
++                        Text::new(
++                            "Make the Warp panel wider to use settings",
++                            appearance.ui_font_family(),
++                            appearance.ui_font_size() + 2.,
++                        )
++                        .with_style(Properties::default().weight(Weight::Semibold))
++                        .with_color(theme.active_ui_text_color().into_solid())
++                        .finish(),
++                        Container::new(
++                            Text::new(
++                                format!(
++                                    "Settings need the panel to be at least {} px wide. Drag the \
++                                     panel's edge, maximize the panel, or move Warp to the editor \
++                                     area. To change settings without widening it, run \"Warp: Open \
++                                     Settings File\" from VS Code's Command Palette.",
++                                    MIN_SETTINGS_WIDTH_EMBEDDED as u32
++                                ),
++                                appearance.ui_font_family(),
++                                appearance.ui_font_size(),
++                            )
++                            .with_color(theme.sub_text_color(theme.background()).into_solid())
++                            .finish(),
++                        )
++                        .with_margin_top(8.)
++                        .finish(),
++                    ])
++                    .finish(),
++            )
++            .with_uniform_padding(24.)
++            .finish(),
++        )
++        .finish()
++    }
++
+     fn render_search_zero_state(&self, appearance: &Appearance) -> Box<dyn Element> {
+         let theme = appearance.theme();
+         Container::new(
+@@ -2703,6 +2751,18 @@ impl View for SettingsView {
+             .with_child(Shrinkable::new(1., sidebar).finish())
+             .with_child(Shrinkable::new(1., page).finish())
+             .finish();
++        let row = if cfg!(feature = "remote_tty") {
++            SizeConstraintSwitch::new(
++                row,
++                vec![(
++                    SizeConstraintCondition::WidthLessThan(MIN_SETTINGS_WIDTH_EMBEDDED),
++                    Self::render_too_narrow(appearance),
++                )],
++            )
++            .finish()
++        } else {
++            row
++        };
+ 
+         let mut stack = Stack::new().with_child(
+             EventHandler::new(
