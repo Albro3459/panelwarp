@@ -209,7 +209,7 @@ class WarpViewProvider {
     this.storageDir = storageDir;
     this.settingsFile = null;
     this.ready = Promise.resolve();
-    this.panelSettings = new PanelSettings(globalState, STORAGE_KEY);
+    this.panelSettings = new PanelSettings(globalState, STORAGE_KEY, () => this.settingsFile.state);
     this.history = null;
     this.ai = null;
     this.log = log;
@@ -282,18 +282,21 @@ class WarpViewProvider {
     switch (msg?.type) {
       case 'warp-loaded':
         this.warpLoaded = true;
+        this.liveSettings = msg.liveSettings === true;
+        this.settingsFile.confirmRouting();
         if (msg.timing) this.log.appendLine(`page loaded (ms since page start): ${JSON.stringify(msg.timing)}`);
         if (this.pendingUrl) {
           this.post({ type: 'warp-navigate', url: this.pendingUrl });
           this.pendingUrl = null;
         }
         break;
-      // Warp's settings live in the page's localStorage; the durable copy is kept here so it
-      // survives the page's origin (random port) changing between sessions.
+      // Warp's settings live in the page's localStorage; the durable copy is kept here
+      // (settings.toml and the globalState mirror) so it survives the page's origin (random port)
+      // changing between sessions.
       case 'warp-storage-request':
         this.post({
           type: 'warp-storage-snapshot',
-          entries: this.globalState.get(STORAGE_KEY, {}),
+          entries: await this.settingsFile.load(),
           history: this.history ? JSON.stringify(this.history.load()) : null,
           session: this.loadSession(),
           workflows: JSON.stringify(
@@ -301,16 +304,10 @@ class WarpViewProvider {
           ),
         });
         break;
-      case 'warp-storage-changes': {
-        const entries = { ...this.globalState.get(STORAGE_KEY, {}) };
-        for (const [key, value] of Object.entries(msg.changes || {})) {
-          if (value === null) delete entries[key];
-          else entries[key] = String(value);
-        }
-        await this.globalState.update(STORAGE_KEY, entries);
-        if ('HostHistorySync' in (msg.changes || {})) await this.syncHistory();
+      case 'warp-storage-changes':
+        await this.settingsFile.save(msg.changes || {});
+        this.onSettingsChanged(msg.changes || {});
         break;
-      }
       case 'warp-ai-generate-commands':
         try {
           const json = await this.ai.generateCommands(
@@ -378,7 +375,10 @@ class WarpViewProvider {
         await this.ai.storeApiKey(String(msg.provider), String(msg.key));
         break;
       case 'warp-open-settings':
-        await this.settingsFile?.open();
+        await this.settingsFile.open();
+        break;
+      case 'warp-open-keybindings':
+        await this.settingsFile.openKeybindings();
         break;
       case 'warp-resolve-paths': {
         let value = [];
@@ -452,6 +452,27 @@ class WarpViewProvider {
 
   post(msg) {
     this.view?.webview.postMessage(msg);
+  }
+
+  /**
+   * Hands the running Warp entries changed in the settings files. Returns false if this Warp build
+   * can't apply them without a reload.
+   */
+  applyStorageChanges(changes) {
+    this.onSettingsChanged(changes);
+    if (!this.view || !this.warpLoaded || !this.liveSettings) return false;
+    if (Object.keys(changes).length) this.post({ type: 'warp-storage-update', changes });
+    return true;
+  }
+
+  /** Acts on the panel's own settings that changed, in Warp or in the files. */
+  onSettingsChanged(changes) {
+    if ('HostHistorySync' in changes) this.syncHistory();
+    if ('HostSettingsSync' in changes) this.updateKeysForSync?.();
+    // The page only reads ?keys= when it loads
+    if ('HostKeysToHost' in changes) {
+      this.post({ type: 'warp-routed-keys', keys: Object.keys(this.panelSettings.keysToVSCode()) });
+    }
   }
 
   /** This workspace's tabs to restore (sessionStore.js), as JSON; null if none or unreadable. */
@@ -561,6 +582,7 @@ function webviewHtml(server, keys) {
       'warp-loaded',
       'warp-record-command',
       'warp-open-settings',
+      'warp-open-keybindings',
       'warp-resolve-paths',
       'warp-open-file',
       'warp-reveal-file',
@@ -606,10 +628,16 @@ function escapeHtml(s) {
 
 function activate(context) {
   const log = vscode.window.createOutputChannel('Warp Terminal for VS Code');
-  // Warp's settings mirror follows the user across machines via VS Code Settings Sync (the API
-  // key stays per machine: SecretStorage doesn't sync).
-  context.globalState.setKeysForSync([STORAGE_KEY, HISTORY_SYNC_KEY]);
+  // Settings live per machine in settings.toml like desktop Warp's. With host.settings_sync on (the
+  // default) VS Code Settings Sync carries the mirror of them to the user's other machines, which
+  // write what arrives into their files (settingsFile.js); opt-in history sync goes the same way.
+  // Until this machine's settings.toml is read, only history is registered.
+  context.globalState.setKeysForSync([HISTORY_SYNC_KEY]);
   const provider = new WarpViewProvider(context.globalState, context.globalStorageUri.fsPath, log);
+  provider.updateKeysForSync = () =>
+    context.globalState.setKeysForSync(
+      provider.panelSettings.get('HostSettingsSync') === true ? [STORAGE_KEY, HISTORY_SYNC_KEY] : [HISTORY_SYNC_KEY],
+    );
   provider.ai = new WarpAi(
     context.secrets,
     log,
@@ -638,12 +666,26 @@ function activate(context) {
     // The conversation's folder may already be open in this window when another one hands it over.
     vscode.window.onDidChangeWindowState((state) => {
       if (state.focused) openPendingClaudeConversation(context.globalState, log);
+      // Settings Sync may have brought another machine's settings while the window was in the
+      // background (VS Code has no event for that)
+      if (state.focused) provider.settingsFile?.apply(false);
     }),
   );
+  provider.settingsFile = new SettingsFile(context, {
+    storageKey: STORAGE_KEY,
+    onChanged: (changes) => provider.applyStorageChanges(changes),
+    onApplied: () => provider.restart(),
+    log,
+  });
   // Warp reads its settings once at startup, so the panel waits for this.
   provider.ready = provider.panelSettings
     .migrateFromVSCodeSettings()
-    .catch((error) => log.appendLine(`settings migration failed: ${error.message}`));
+    .catch((error) => log.appendLine(`settings migration failed: ${error.message}`))
+    .then(() => provider.settingsFile.migrate())
+    .catch((error) => log.appendLine(`moving settings into settings.toml failed: ${error.message}`))
+    // Before history sync below reads host.history_sync
+    .then(() => provider.settingsFile.load())
+    .then(() => provider.updateKeysForSync());
   try {
     provider.history = new CommandHistory(context.globalStorageUri.fsPath);
     provider.history.shell = startupShell();
@@ -660,11 +702,6 @@ function activate(context) {
   } catch (error) {
     log.appendLine(`tab restoration unavailable: ${error.message}`);
   }
-  provider.settingsFile = new SettingsFile(context, {
-    storageKey: STORAGE_KEY,
-    onApplied: () => provider.restart(),
-    log,
-  });
   // VS Code remembers where views were moved (per profile); the context key hides the
   // placeholder while Warp is in the side bar.
   vscode.commands.executeCommand('setContext', IN_SIDE_BAR_KEY, context.globalState.get(IN_SIDE_BAR_KEY, false));
@@ -709,6 +746,8 @@ function activate(context) {
       await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
     }),
     vscode.commands.registerCommand('warp.restart', () => provider.restart()),
+    vscode.commands.registerCommand('warp.openSettingsFile', () => provider.settingsFile.open()),
+    vscode.commands.registerCommand('warp.openKeybindingsFile', () => provider.settingsFile.openKeybindings()),
     vscode.commands.registerCommand('warp.benchmarkCommandSearch', () => provider.ai.benchmark()),
     vscode.commands.registerCommand('warp.setOpenRouterApiKey', () =>
       provider.openWarpUrl('warposs://settings?widget=host_api_key'),
