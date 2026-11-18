@@ -1,7 +1,7 @@
-From 7a3b51ff17f91f027c5e288ca7e6b888d6ef2bd4 Mon Sep 17 00:00:00 2001
+From d3a2e45314b0027fc54439c61a4c507adab6d61a Mon Sep 17 00:00:00 2001
 From: Alex Brodsky <122503996+Albro3459@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 12:30:32 -0600
-Subject: [PATCH] Reload settings and keybindings when the web host asks
+Subject: [PATCH 66/70] Reload settings and keybindings when the web host asks
 
 Desktop Warp applies settings.toml edits while it runs, but the web
 build only reads localStorage at startup, so an embedding host that
@@ -25,7 +25,7 @@ and font size applied after warpPanelReloadSettings() without a reload.
  3 files changed, 96 insertions(+)
 
 diff --git a/app/src/keyboard.rs b/app/src/keyboard.rs
-index b638e366d..94c6d353f 100644
+index b638e36..94c6d35 100644
 --- a/app/src/keyboard.rs
 +++ b/app/src/keyboard.rs
 @@ -62,6 +62,46 @@ pub fn load_custom_keybindings(app: &mut AppContext) {
@@ -76,7 +76,7 @@ index b638e366d..94c6d353f 100644
  /// using the name of the editable binding and the new keystrokes
  /// if keystrokes is UserDefinedKeybinding::Removed
 diff --git a/app/src/lib.rs b/app/src/lib.rs
-index c8bcf5455..fe81ff715 100644
+index c8bcf54..fe81ff7 100644
 --- a/app/src/lib.rs
 +++ b/app/src/lib.rs
 @@ -2091,6 +2091,8 @@ pub(crate) fn initialize_app(
@@ -89,7 +89,7 @@ index c8bcf5455..fe81ff715 100644
      ctx.add_singleton_model(CustomSecretRegexUpdater::new);
  
 diff --git a/app/src/platform/wasm.rs b/app/src/platform/wasm.rs
-index 682aa36f5..7653e38c4 100644
+index 682aa36..7653e38 100644
 --- a/app/src/platform/wasm.rs
 +++ b/app/src/platform/wasm.rs
 @@ -879,3 +879,57 @@ pub mod host_session {
