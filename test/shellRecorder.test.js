@@ -256,3 +256,44 @@ test('an SSH session that ended while no page showed it is kept for the next pag
   );
   assert.equal(recorder.running, false);
 });
+
+// Sessions Warp bootstraps inside the shell, as output that fakes them would print them
+function nestedSessions(count, padding = '') {
+  const chunks = [];
+  for (let i = 0; i < count; i++) {
+    const session = { session_id: 1000 + i };
+    chunks.push(padding, hook('InitShell', session), hook('Bootstrapped', session));
+  }
+  return chunks;
+}
+
+test('nesting up to the limit keeps the shell adoptable', () => {
+  const recorder = shellOutput(BOOTSTRAP, PROMPT_HOOK, PROMPT, ...nestedSessions(16));
+  assert.equal(recorder.nested.length, 16);
+  assert.notEqual(recorder.replay(), null);
+});
+
+test('output faking deeper nesting makes the shell not adoptable and frees its memory', () => {
+  const recorder = shellOutput(BOOTSTRAP, PROMPT_HOOK, PROMPT, ...nestedSessions(17));
+  assert.equal(recorder.replay(), null);
+  assert.deepEqual(recorder.nested, []);
+  assert.deepEqual(recorder.bootstrap, []);
+  // Later output isn't kept either
+  recorder.record(Buffer.from('more output'), true);
+  assert.equal(recorder.tailHeadBytes + recorder.tailRestBytes, 0);
+});
+
+test('output faking nested sessions with large starts is capped by size', () => {
+  const recorder = shellOutput(BOOTSTRAP, PROMPT_HOOK, PROMPT, ...nestedSessions(3, 'x'.repeat(3 * 1024 * 1024)));
+  assert.equal(recorder.replay(), null);
+  assert.equal(recorder.nestedBytes, 0);
+});
+
+test('leaving nested sessions gives their bytes back to the budget', () => {
+  const recorder = shellOutput(BOOTSTRAP, PROMPT_HOOK, PROMPT, ...nestedSessions(2, 'x'.repeat(1024)));
+  assert.ok(recorder.nestedBytes > 2048);
+  recorder.record(Buffer.from(hook('CommandFinished', { exit_code: 0 }) + PROMPT_HOOK + PROMPT, 'latin1'), true);
+  assert.equal(recorder.nested.length, 0);
+  assert.equal(recorder.nestedBytes, 0);
+  assert.notEqual(recorder.replay(), null);
+});

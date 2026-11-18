@@ -28,6 +28,11 @@ const MAX_BOOTSTRAP_BYTES = 8 * 1024 * 1024;
  * mode switches) and the newest output, dropping the middle past this. */
 const TAIL_HEAD_BYTES = 256 * 1024;
 const MAX_TAIL_BYTES = 4 * 1024 * 1024;
+/** SSH sessions and subshells followed, and the output kept for starting them. Real nesting stays
+ * far below both; output that fakes more (a file with Warp's hooks in it, cat'ed) makes the shell
+ * one a new page can't take over, rather than growing the PTY host's memory. */
+const MAX_NESTED_SESSIONS = 16;
+const MAX_NESTED_BYTES = 8 * 1024 * 1024;
 /** `ESC ] 0 ;` or `ESC ] 2 ;` <title> BEL or ST */
 const TITLE = /\x1b\][02];[^\x07\x1b]*(?:\x07|\x1b\\)/g;
 /** `ESC P $ f` <JSON> `ESC \`: a subshell asking Warp to bootstrap it (InitSubshell, or
@@ -51,6 +56,7 @@ class ShellRecorder {
     /** SSH sessions and subshells the shell runs, innermost last, each with the output from the
      * outer session's prompt through its bootstrap. */
     this.nested = [];
+    this.nestedBytes = 0;
     /** Whether the innermost session is running the user's command, rather than waiting at its
      * prompt. A new page drops its own writes while it is, so they don't reach the command. */
     this.running = false;
@@ -116,6 +122,8 @@ class ShellRecorder {
       if (ownHook && hook.name === 'Bootstrapped') this.bootstrapped = true;
       return;
     }
+    // Nothing more is needed once a new page can't take the shell over
+    if (!this.adoptable) return;
     if (!hook && bytes.includes('\x1b]')) {
       const titles = bytes.toString('latin1').match(TITLE);
       if (titles) this.title = Buffer.from(titles[titles.length - 1], 'latin1');
@@ -127,7 +135,9 @@ class ShellRecorder {
     if (level >= 0 && level < this.nested.length) {
       // An outer session is back (the user left SSH), so the nested ones' output belongs to its
       // command
-      const chunks = [...this.nested.splice(level).map((n) => n.start), ...this.tailHead, ...this.tailRest];
+      const left = this.nested.splice(level);
+      for (const n of left) this.nestedBytes -= n.start.length;
+      const chunks = [...left.map((n) => n.start), ...this.tailHead, ...this.tailRest];
       this.resetTail();
       for (const chunk of chunks) this.pushTail(chunk);
       this.running = true;
@@ -140,7 +150,15 @@ class ShellRecorder {
         .toString('latin1')
         .replace(SUBSHELL_REQUEST, '');
       this.nested.push({ sessionId: hook.sessionId, start: Buffer.from(start, 'latin1') });
+      this.nestedBytes += start.length;
       this.resetTail();
+      if (this.nested.length > MAX_NESTED_SESSIONS || this.nestedBytes > MAX_NESTED_BYTES) {
+        this.adoptable = false;
+        this.bootstrap = [];
+        this.nested = [];
+        this.nestedBytes = 0;
+        this.idleOutput = null;
+      }
       return;
     }
     const currentHook = level >= 0;
