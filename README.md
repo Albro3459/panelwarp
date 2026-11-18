@@ -18,7 +18,8 @@ local PTY server, so you get Warp's terminal without leaving VS Code:
   Keybindings File**). VS Code Settings Sync carries both to your other machines; turn off **Sync
   settings** (`host.settings_sync`, Warp's Privacy settings) on a machine to keep its own. Command
   history syncs too if you turn on `host.history_sync`. A remote window (SSH, WSL, containers)
-  keeps its files on the remote machine.
+  keeps its files on the remote machine. While either file is open in an editor, Warp's settings
+  stay closed (opening them asks to close the file), so they always show what the file says.
 
 Warp's account, cloud and Agent Mode features are hidden: no Warp account or sign-in is needed.
 

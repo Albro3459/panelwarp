@@ -1,7 +1,7 @@
 From d3a2e45314b0027fc54439c61a4c507adab6d61a Mon Sep 17 00:00:00 2001
 From: Alex Brodsky <122503996+Albro3459@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 12:30:32 -0600
-Subject: [PATCH 66/72] Reload settings and keybindings when the web host asks
+Subject: [PATCH 66/74] Reload settings and keybindings when the web host asks
 
 Desktop Warp applies settings.toml edits while it runs, but the web
 build only reads localStorage at startup, so an embedding host that

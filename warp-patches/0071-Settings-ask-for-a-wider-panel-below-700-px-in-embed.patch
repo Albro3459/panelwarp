@@ -1,7 +1,7 @@
 From ac01703a0285136fa69c6b385024274848dbe201 Mon Sep 17 00:00:00 2001
 From: Felix Krueckel <hi@felkru.com>
 Date: Wed, 18 Nov 2026 11:22:14 +0100
-Subject: [PATCH 71/72] Settings ask for a wider panel below 700 px in embedded
+Subject: [PATCH 71/74] Settings ask for a wider panel below 700 px in embedded
  builds
 
 Below the sidebar plus the page's designed 520 px minimum, settings rows overlap: labels run into their dropdowns and hints. Embedded builds now show "Make the Warp panel wider to use settings" there instead, with how to widen it and the Open Settings File command as the alternative.

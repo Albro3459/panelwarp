@@ -12,6 +12,7 @@ const path = require('path');
 const { shellLaunch, wasmEtag } = require('./server');
 const { ensurePtyHost } = require('./ptyHost');
 const { SettingsFile } = require('./settingsFile');
+const { SettingsFileGuard } = require('./settingsFileGuard');
 const { WarpAi } = require('./ai');
 const { PanelSettings, confirm } = require('./panelSettings');
 const { CommandHistory } = require('./history');
@@ -284,6 +285,7 @@ class WarpViewProvider {
         this.warpLoaded = true;
         this.liveSettings = msg.liveSettings === true;
         this.settingsFile.confirmRouting();
+        this.post({ type: 'warp-settings-file-state', open: this.settingsGuard?.open === true });
         if (msg.timing) this.log.appendLine(`page loaded (ms since page start): ${JSON.stringify(msg.timing)}`);
         if (this.pendingUrl) {
           this.post({ type: 'warp-navigate', url: this.pendingUrl });
@@ -379,6 +381,14 @@ class WarpViewProvider {
         break;
       case 'warp-open-keybindings':
         await this.settingsFile.openKeybindings();
+        break;
+      case 'warp-request-settings':
+        // Opening settings while the file is open: close it first, apply it, then open them
+        if (await this.settingsGuard?.requestClose()) {
+          await this.settingsFile.apply(false);
+          this.post({ type: 'warp-settings-file-state', open: false });
+          this.post({ type: 'warp-open-settings-page', page: String(msg.page || '') });
+        }
         break;
       case 'warp-resolve-paths': {
         let value = [];
@@ -583,6 +593,7 @@ function webviewHtml(server, keys) {
       'warp-record-command',
       'warp-open-settings',
       'warp-open-keybindings',
+      'warp-request-settings',
       'warp-resolve-paths',
       'warp-open-file',
       'warp-reveal-file',
@@ -675,6 +686,13 @@ function activate(context) {
     storageKey: STORAGE_KEY,
     onChanged: (changes) => provider.applyStorageChanges(changes),
     onApplied: () => provider.restart(),
+    log,
+  });
+  // Warp's settings stay closed while settings.toml or keybindings.yaml is open in an editor
+  provider.settingsGuard = new SettingsFileGuard(vscode, context, {
+    dir: context.globalStorageUri.fsPath,
+    files: [provider.settingsFile.file, provider.settingsFile.keybindingsFile],
+    onState: (open) => provider.post({ type: 'warp-settings-file-state', open }),
     log,
   });
   // Warp reads its settings once at startup, so the panel waits for this.

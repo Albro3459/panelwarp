@@ -246,6 +246,21 @@
       // And for "Open keybindings file" on Warp's keyboard shortcuts page, which shows only when
       // this exists; the extension opens keybindings.yaml.
       window.warpPanelOpenKeybindingsFile = () => toExtension({ type: 'warp-open-keybindings' });
+      // While settings.toml or keybindings.yaml is open in an editor, Warp's settings stay closed
+      // so they always open showing what the files say (app/src/platform/wasm.rs): opening a file
+      // closes them, and opening them asks the extension to close the file first.
+      let settingsFileOpen = false;
+      window.warpPanelSettingsFileOpen = () => settingsFileOpen;
+      window.warpPanelRequestSettings = (page) => toExtension({ type: 'warp-request-settings', page: String(page || '') });
+      window.addEventListener('message', (e) => {
+        if (e.source !== window.parent) return;
+        if (e.data?.type === 'warp-settings-file-state') {
+          settingsFileOpen = e.data.open === true;
+          if (settingsFileOpen) window.warpPanelCloseSettings?.();
+        } else if (e.data?.type === 'warp-open-settings-page') {
+          window.warpPanelOpenSettingsPage?.(String(e.data.page || ''));
+        }
+      });
       // Clickable file paths in terminal output (app/src/terminal/view/link_detection.rs): the
       // extension checks which possible paths exist (filePaths.js) and opens or reveals them.
       const pendingPaths = new Map();

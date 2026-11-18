@@ -103,6 +103,44 @@ ${TOML.stringify(panelDefaults)
   .join('\n')}
 `;
 
+// The comment line that ends the header's text before the commented panel defaults
+const DEFAULTS_INTRO = '# this comment.\n';
+
+/**
+ * A panel default edited inside the header's comment (e.g. "# history_sync = true") is easy to
+ * mistake for a setting. Returns the text with each one that differs from its default, and that the
+ * file doesn't set itself, moved into the settings, and the header restored; null if there's none.
+ */
+function promoteEditedDefaults(text) {
+  const intro = text.indexOf(DEFAULTS_INTRO);
+  if (intro === -1) return null;
+  const lines = text.slice(intro + DEFAULTS_INTRO.length).split('\n');
+  const commented = [];
+  for (const line of lines) {
+    if (!line.startsWith('#')) break;
+    commented.push(line.replace(/^# ?/, ''));
+  }
+  let block;
+  let doc;
+  try {
+    block = TOML.parse(commented.join('\n'));
+    doc = TOML.parse(text);
+  } catch {
+    return null;
+  }
+  const promoted = [];
+  for (const [storageKey, value] of Object.entries(DEFAULTS)) {
+    const tomlPath = SETTINGS_MAP[storageKey];
+    const edited = getPath(block, tomlPath);
+    if (edited === undefined || getPath(doc, tomlPath) !== undefined) continue;
+    if (isDeepStrictEqual(JSON.parse(JSON.stringify(edited)), value)) continue;
+    setPath(doc, tomlPath, edited);
+    promoted.push(tomlPath);
+  }
+  if (!promoted.length) return null;
+  return { text: HEADER + '\n' + TOML.stringify(doc), promoted };
+}
+
 /** Renders the mirrored localStorage entries as settings.toml text. */
 function renderToml(entries) {
   const doc = {};
@@ -317,6 +355,7 @@ class SettingsFile {
       return { changes: {}, errors: [] };
     }
     this.pullSynced();
+    this.promoteEditedDefaults();
     let errors;
     let settingsReadable;
     const fromFiles = () => {
@@ -362,6 +401,26 @@ class SettingsFile {
     for (const key of Object.keys(changes)) this.pendingChanges.add(key);
     if (Object.keys(changes).length) await this.updateMirror(changes);
     return { changes, errors };
+  }
+
+  /** Moves panel defaults edited inside settings.toml's header comment into its settings. */
+  promoteEditedDefaults() {
+    let result;
+    try {
+      result = promoteEditedDefaults(read(this.file));
+      if (result) fs.writeFileSync(this.file, result.text);
+    } catch (error) {
+      this.log.appendLine(`settings.toml: ${error.message}`);
+      return;
+    }
+    if (!result) return;
+    const names = result.promoted.join(', ');
+    this.log.appendLine(`settings.toml: applied ${names} from the header comment`);
+    vscode.window.showInformationMessage(
+      `Warp applied ${names} from the comment in settings.toml and moved ${
+        result.promoted.length === 1 ? 'it' : 'them'
+      } out of the comment.`,
+    );
   }
 
   /** Records whether private routing may be off on this machine. */
@@ -582,4 +641,4 @@ class SettingsFile {
   }
 }
 
-module.exports = { SettingsFile, renderToml, applyToml, updateToml };
+module.exports = { SettingsFile, renderToml, applyToml, updateToml, promoteEditedDefaults };

@@ -436,3 +436,26 @@ test("a new machine's files start from the synced mirror without its sync choice
 function encodeNumber(n) {
   return JSON.stringify(JSON.stringify(n));
 }
+
+test('a panel default edited inside the header comment applies and moves out of it', async (t) => {
+  const f = await fixture(t);
+  const text = fs.readFileSync(f.settings.file, 'utf8');
+  assert.match(text, /^# history_sync = false$/m);
+  fs.writeFileSync(f.settings.file, text.replace(/^# history_sync = false$/m, '# history_sync = true'));
+  await f.settings.apply(false);
+  assert.equal(f.page.HostHistorySync, '"true"');
+  const after = fs.readFileSync(f.settings.file, 'utf8');
+  assert.equal(TOML.parse(after).host.history_sync, true);
+  // The comment shows the default again
+  assert.match(after, /^# history_sync = false$/m);
+});
+
+test('the header comment does not override a setting the file sets', () => {
+  const { promoteEditedDefaults, renderToml } = loadSettings({});
+  assert.equal(promoteEditedDefaults(renderToml({})), null);
+  // An unedited header, or an edit to a setting set below it, changes nothing
+  const set = renderToml({}).replace(/^# history_sync = false$/m, '# history_sync = true') + '\n[host]\nhistory_sync = false\n';
+  assert.equal(promoteEditedDefaults(set), null);
+  // A broken comment block is left alone
+  assert.equal(promoteEditedDefaults(renderToml({}).replace('# [host]', '# [host')), null);
+});
