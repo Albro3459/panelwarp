@@ -1,7 +1,7 @@
 From 611795d88b1138bc961778fe700c964e2f08d98e Mon Sep 17 00:00:00 2001
 From: Felix Krueckel <hi@felkru.com>
 Date: Mon, 19 Oct 2026 01:16:37 -0700
-Subject: [PATCH 64/71] Reopen a closed tab with its running shell in embedded
+Subject: [PATCH 64/72] Reopen a closed tab with its running shell in embedded
  builds
 
 Closing a tab whose command was still running shut that pane's PTY down right away, as on
