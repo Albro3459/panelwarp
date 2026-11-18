@@ -1,0 +1,167 @@
+From 9acae878b47ba9a7f8e8fc4b79e7bd5e0a7b50ba Mon Sep 17 00:00:00 2001
+From: Felix Krueckel <acc@felkru.com>
+Date: Wed, 18 Nov 2026 10:16:01 +0100
+Subject: [PATCH] Privacy page: Sync settings toggle for the host app
+
+Embedded builds get a host.settings_sync setting (on by default, kept per machine) and a "Sync settings" switch above "Sync command history" on the Privacy page. The host app syncs Warp's settings and keybindings through VS Code Settings Sync while it is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/settings/host_ai.rs           | 10 +++
+ app/src/settings_view/privacy_page.rs | 90 +++++++++++++++++++++++++--
+ 2 files changed, 96 insertions(+), 4 deletions(-)
+
+diff --git a/app/src/settings/host_ai.rs b/app/src/settings/host_ai.rs
+index c55e3ef..2d4befe 100644
+--- a/app/src/settings/host_ai.rs
++++ b/app/src/settings/host_ai.rs
+@@ -162,6 +162,16 @@ define_settings_group!(HostAiSettings, settings: [
+         toml_path: "host.ai.local_server",
+         description: "Base URL of the local model server's OpenAI-compatible API (LM Studio's default is http://127.0.0.1:1234/v1).",
+     },
++    settings_sync: HostSettingsSync {
++        type: bool,
++        default: true,
++        supported_platforms: SupportedPlatforms::ALL,
++        sync_to_cloud: SyncToCloud::Never,
++        surface: settings::SettingSurfaces::GUI,
++        private: false,
++        toml_path: "host.settings_sync",
++        description: "Sync Warp's settings and keybindings across machines with VS Code Settings Sync. Each machine keeps its own choice of this setting.",
++    },
+     history_sync: HostHistorySync {
+         type: bool,
+         default: false,
+diff --git a/app/src/settings_view/privacy_page.rs b/app/src/settings_view/privacy_page.rs
+index d0cd73e..af98b34 100644
+--- a/app/src/settings_view/privacy_page.rs
++++ b/app/src/settings_view/privacy_page.rs
+@@ -44,8 +44,8 @@ use crate::modal::{Modal, ModalEvent, ModalViewState};
+ use crate::send_telemetry_from_ctx;
+ use crate::server::telemetry::TelemetryEvent;
+ use crate::settings::{
+-    AISettings, CustomSecretRegex, HostAiSettings, HostHistorySync, PrivacySettings,
+-    RegexDisplayInfo,
++    AISettings, CustomSecretRegex, HostAiSettings, HostHistorySync, HostSettingsSync,
++    PrivacySettings, RegexDisplayInfo,
+ };
+ use crate::settings_view::privacy::AddRegexModalViewState;
+ use crate::settings_view::render_body_item_label;
+@@ -223,12 +223,13 @@ impl PrivacyPageView {
+ 
+     fn build_page() -> PageType<Self> {
+         // Embedded (`remote_tty`) builds have no Warp account, cloud or telemetry (forced off in
+-        // `PrivacySettings`): only the local secret redaction is left, plus the host app's opt-in
+-        // command history sync.
++        // `PrivacySettings`): only the local secret redaction is left, plus the host app's settings
++        // sync and opt-in command history sync.
+         if cfg!(feature = "remote_tty") {
+             return PageType::new_uncategorized(
+                 vec![
+                     Box::new(SecretRedactionWidget::default()),
++                    Box::new(HostSettingsSyncWidget::default()),
+                     Box::new(HostHistorySyncWidget::default()),
+                 ],
+                 Some(PageTitle::new("Privacy")),
+@@ -519,6 +520,7 @@ pub enum PrivacyPageAction {
+     ShowAddRegexModal,
+     AddRecommendedRegex(usize),
+     SwitchSecretRedactionTab(SecretRedactionTab),
++    ToggleHostSettingsSync,
+     ToggleHostHistorySync,
+ }
+ 
+@@ -593,6 +595,13 @@ impl TypedActionView for PrivacyPageView {
+             }
+             PrivacyPageAction::ToggleTelemetry => self.toggle_telemetry(ctx),
+             PrivacyPageAction::ToggleCrashReporting => self.toggle_crash_reporting(ctx),
++            PrivacyPageAction::ToggleHostSettingsSync => {
++                HostAiSettings::handle(ctx).update(ctx, |settings, ctx| {
++                    let enabled = !*settings.settings_sync;
++                    report_if_error!(settings.settings_sync.set_value(enabled, ctx));
++                });
++                ctx.notify();
++            }
+             PrivacyPageAction::ToggleHostHistorySync => {
+                 HostAiSettings::handle(ctx).update(ctx, |settings, ctx| {
+                     let enabled = !*settings.history_sync;
+@@ -1663,6 +1672,79 @@ impl SettingsWidget for CrashReportsWidget {
+     }
+ }
+ 
++/// Sync of Warp's settings and keybindings across machines, done by the host app (VS Code Settings
++/// Sync), in embedded builds. On by default; each machine keeps its own choice.
++#[derive(Default)]
++struct HostSettingsSyncWidget {
++    switch_state: SwitchStateHandle,
++}
++
++impl SettingsWidget for HostSettingsSyncWidget {
++    type View = PrivacyPageView;
++
++    fn search_terms(&self) -> &str {
++        "settings keybindings sync machines settings sync"
++    }
++
++    fn render(
++        &self,
++        view: &Self::View,
++        appearance: &Appearance,
++        app: &AppContext,
++    ) -> Box<dyn Element> {
++        let ui_builder = appearance.ui_builder();
++        let local_only_icon_state = LocalOnlyIconState::for_setting(
++            HostSettingsSync::storage_key(),
++            HostSettingsSync::sync_to_cloud(),
++            &mut view.local_only_icon_tooltip_states.borrow_mut(),
++            app,
++        );
++        Flex::column()
++            .with_child(render_body_item::<PrivacyPageAction>(
++                "Sync settings".into(),
++                None,
++                local_only_icon_state,
++                ToggleState::Enabled,
++                appearance,
++                ui_builder
++                    .switch(self.switch_state.clone())
++                    .check(*HostAiSettings::as_ref(app).settings_sync)
++                    .build()
++                    .on_click(move |ctx, _, _| {
++                        ctx.dispatch_typed_action(PrivacyPageAction::ToggleHostSettingsSync)
++                    })
++                    .finish(),
++                None,
++            ))
++            .with_child(
++                ui_builder
++                    .paragraph(
++                        "Syncs your Warp settings and keybindings to your other machines with VS \
++                         Code Settings Sync. Turning private routing off still asks on each \
++                         machine. Turn this off to keep this machine's settings to itself."
++                            .to_owned(),
++                    )
++                    .with_style(UiComponentStyles {
++                        font_color: Some(
++                            appearance
++                                .theme()
++                                .sub_text_color(appearance.theme().surface_2())
++                                .into_solid(),
++                        ),
++                        margin: Some(
++                            Coords::default()
++                                .top(styles::DESCRIPTION_NEGATIVE_MARGIN_OFFSET)
++                                .bottom(styles::DESCRIPTION_MARGIN_BOTTOM),
++                        ),
++                        ..Default::default()
++                    })
++                    .build()
++                    .finish(),
++            )
++            .finish()
++    }
++}
++
+ /// Opt-in sync of the newest commands across machines, done by the host app (VS Code Settings
+ /// Sync), in embedded builds.
+ #[derive(Default)]

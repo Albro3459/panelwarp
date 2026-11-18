@@ -468,6 +468,7 @@ class WarpViewProvider {
   /** Acts on the panel's own settings that changed, in Warp or in the files. */
   onSettingsChanged(changes) {
     if ('HostHistorySync' in changes) this.syncHistory();
+    if ('HostSettingsSync' in changes) this.updateKeysForSync?.();
     // The page only reads ?keys= when it loads
     if ('HostKeysToHost' in changes) {
       this.post({ type: 'warp-routed-keys', keys: Object.keys(this.panelSettings.keysToVSCode()) });
@@ -627,10 +628,16 @@ function escapeHtml(s) {
 
 function activate(context) {
   const log = vscode.window.createOutputChannel('Warp Terminal for VS Code');
-  // Only opt-in history sync goes through VS Code Settings Sync. Settings stay per machine in
-  // settings.toml like desktop Warp's, so the mirror isn't synced either.
+  // Settings live per machine in settings.toml like desktop Warp's. With host.settings_sync on (the
+  // default) VS Code Settings Sync carries the mirror of them to the user's other machines, which
+  // write what arrives into their files (settingsFile.js); opt-in history sync goes the same way.
+  // Until this machine's settings.toml is read, only history is registered.
   context.globalState.setKeysForSync([HISTORY_SYNC_KEY]);
   const provider = new WarpViewProvider(context.globalState, context.globalStorageUri.fsPath, log);
+  provider.updateKeysForSync = () =>
+    context.globalState.setKeysForSync(
+      provider.panelSettings.get('HostSettingsSync') === true ? [STORAGE_KEY, HISTORY_SYNC_KEY] : [HISTORY_SYNC_KEY],
+    );
   provider.ai = new WarpAi(
     context.secrets,
     log,
@@ -659,6 +666,9 @@ function activate(context) {
     // The conversation's folder may already be open in this window when another one hands it over.
     vscode.window.onDidChangeWindowState((state) => {
       if (state.focused) openPendingClaudeConversation(context.globalState, log);
+      // Settings Sync may have brought another machine's settings while the window was in the
+      // background (VS Code has no event for that)
+      if (state.focused) provider.settingsFile?.apply(false);
     }),
   );
   provider.settingsFile = new SettingsFile(context, {
@@ -674,7 +684,8 @@ function activate(context) {
     .then(() => provider.settingsFile.migrate())
     .catch((error) => log.appendLine(`moving settings into settings.toml failed: ${error.message}`))
     // Before history sync below reads host.history_sync
-    .then(() => provider.settingsFile.load());
+    .then(() => provider.settingsFile.load())
+    .then(() => provider.updateKeysForSync());
   try {
     provider.history = new CommandHistory(context.globalStorageUri.fsPath);
     provider.history.shell = startupShell();
