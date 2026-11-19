@@ -423,6 +423,124 @@ test('private routing turned off on another machine still asks on this one', asy
   assert.equal(TOML.parse(fs.readFileSync(f.settings.file, 'utf8')).host.ai.private_routing, true);
 });
 
+// Machine A turns private routing off and confirms it, and machine B gets that through settings sync
+async function routingOffOnA(t) {
+  const a = await fixture(t);
+  a.allowRouting();
+  fs.writeFileSync(a.settings.file, '[host.ai]\nprivate_routing = false\n');
+  await a.settings.apply(true);
+  const b = await fixture(t);
+  b.receiveSync(a.mirror);
+  return { a, b, stamp: a.mirror.__panelwarpSync };
+}
+
+// A pulls what B left in the mirror and keeps routing off
+async function assertOffOnA(a, b) {
+  a.receiveSync(b.mirror);
+  await a.settings.apply(false);
+  assert.equal(a.page.HostAiPrivateRouting, '"false"');
+  assert.equal(TOML.parse(fs.readFileSync(a.settings.file, 'utf8')).host.ai.private_routing, false);
+}
+
+test('private routing kept on by a machine that has not been asked stays off where it was turned off', async (t) => {
+  const { a, b } = await routingOffOnA(t);
+  await a.settings.save({ FontSize: '"15"' });
+  b.receiveSync(a.mirror);
+  await b.settings.apply(false);
+  assert.equal(b.page.HostAiPrivateRouting, '"true"');
+  // B passes on A's font as its own change, without routing
+  assert.equal(b.mirror.FontSize, '"15"');
+  assert.equal(b.mirror.__panelwarpSync.from, fs.readFileSync(b.settings.syncIdFile, 'utf8'));
+  assert.equal(b.mirror.HostAiPrivateRouting, '"false"');
+  await assertOffOnA(a, b);
+});
+
+test('declining private routing off from another machine keeps it off there', async (t) => {
+  const { a, b, stamp } = await routingOffOnA(t);
+  await b.settings.apply(true);
+  assert.equal(b.confirmations.length, 1);
+  assert.equal(b.page.HostAiPrivateRouting, '"true"');
+  assert.equal(TOML.parse(fs.readFileSync(b.settings.file, 'utf8')).host.ai.private_routing, true);
+  assert.equal(b.mirror.HostAiPrivateRouting, '"false"');
+  assert.deepEqual(b.mirror.__panelwarpSync, stamp);
+  await assertOffOnA(a, b);
+});
+
+test("a new window on a machine that declined private routing off doesn't turn it back on", async (t) => {
+  const { a, b, stamp } = await routingOffOnA(t);
+  await b.settings.apply(true);
+  // B's next window starts from the mirror, which has A's "off", and reads routing on from the file
+  const window = await fixture(t, { dir: path.dirname(b.settings.file), mirror: b.mirror });
+  assert.equal(window.settings.state.HostAiPrivateRouting, '"true"');
+  assert.equal(window.mirror.HostAiPrivateRouting, '"false"');
+  assert.deepEqual(window.mirror.__panelwarpSync, stamp);
+  await assertOffOnA(a, window);
+});
+
+test('a new window keeps private routing on while settings.toml is broken', async (t) => {
+  const { a, b, stamp } = await routingOffOnA(t);
+  await b.settings.apply(true);
+  fs.appendFileSync(b.settings.file, '\n[broken\n');
+  const window = await fixture(t, { dir: path.dirname(b.settings.file), mirror: b.mirror });
+  assert.equal(window.errors.length, 1);
+  assert.equal(window.settings.state.HostAiPrivateRouting, '"true"');
+  assert.equal(window.mirror.HostAiPrivateRouting, '"false"');
+  assert.deepEqual(window.mirror.__panelwarpSync, stamp);
+  await assertOffOnA(a, window);
+});
+
+test('a new remote host whose mirror has private routing off from another machine asks once', async (t) => {
+  const { a, b, stamp } = await routingOffOnA(t);
+  await b.settings.apply(true);
+  // A remote window of B's on a new host shares B's mirror and has its own files
+  const host = await fixture(t, { mirror: b.mirror });
+  assert.equal(fs.existsSync(host.settings.routingAllowedFile), false);
+  assert.equal(host.settings.state.HostAiPrivateRouting, '"true"');
+  assert.equal(host.settings.routingPending, true);
+  await host.settings.apply(true);
+  assert.equal(host.confirmations.length, 1);
+  assert.equal(TOML.parse(fs.readFileSync(host.settings.file, 'utf8')).host.ai.private_routing, true);
+  assert.equal(host.mirror.HostAiPrivateRouting, '"false"');
+  assert.deepEqual(host.mirror.__panelwarpSync, stamp);
+  await assertOffOnA(a, host);
+});
+
+test('a mirror from before settings sync with private routing off keeps it off without asking', async (t) => {
+  const f = await fixture(t, { mirror: { HostAiPrivateRouting: '"false"' } });
+  assert.equal(fs.existsSync(f.settings.routingAllowedFile), true);
+  assert.equal(f.settings.state.HostAiPrivateRouting, '"false"');
+  await f.settings.apply(true);
+  assert.equal(f.confirmations.length, 0);
+  assert.equal(f.page.HostAiPrivateRouting, '"false"');
+});
+
+test('a machine that turned private routing off can turn it back on everywhere', async (t) => {
+  const { a, b } = await routingOffOnA(t);
+  b.allowRouting();
+  await b.settings.apply(true);
+  assert.equal(b.page.HostAiPrivateRouting, '"false"');
+  fs.writeFileSync(a.settings.file, '[host.ai]\nprivate_routing = true\n');
+  await a.settings.apply(false);
+  assert.equal(a.mirror.HostAiPrivateRouting, '"true"');
+  b.receiveSync(a.mirror);
+  await b.settings.apply(false);
+  assert.equal(b.page.HostAiPrivateRouting, '"true"');
+});
+
+test("turning private routing back on in one window isn't undone by another window's late mirror", async (t) => {
+  const w1 = await fixture(t);
+  w1.allowRouting();
+  fs.writeFileSync(w1.settings.file, '[host.ai]\nprivate_routing = false\n');
+  await w1.settings.apply(true);
+  const w2 = await fixture(t, { dir: path.dirname(w1.settings.file), mirror: w1.mirror });
+  await w1.settings.save({ HostAiPrivateRouting: '"true"', FontSize: '"16"' });
+  // Window 2's watcher runs before window 1's mirror write reaches it
+  await w2.settings.apply(false);
+  assert.equal(w2.page.HostAiPrivateRouting, '"true"');
+  assert.equal(w2.mirror.HostAiPrivateRouting, '"true"');
+  assert.equal(w2.mirror.FontSize, '"16"');
+});
+
 test("a new machine's files start from the synced mirror without its sync choice", async (t) => {
   const f = await fixture(t, { mirror: otherMachine({ FontSize: '"15"', HostSettingsSync: '"false"' }) });
   assert.equal(fontSize(f), 15);

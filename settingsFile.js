@@ -275,6 +275,8 @@ class SettingsFile {
     this.pendingChanges = new Set();
     // Set while the files turn private routing off and nothing has asked about it yet
     this.routingPending = false;
+    // Set while the files this window last read have private routing off, allowed on this machine
+    this.routingOffHere = false;
     const dir = context.globalStorageUri.fsPath;
     this.file = path.join(dir, 'settings.toml');
     this.keybindingsFile = path.join(dir, 'keybindings.yaml');
@@ -332,10 +334,11 @@ class SettingsFile {
     if (typeof mirror[KEYBINDINGS_KEY] === 'string') {
       replace(this.keybindingsFile, JSON.parse(mirror[KEYBINDINGS_KEY]));
     }
-    // Routing off in the mirror was confirmed when it was turned off
-    this.setRoutingOffAllowed(!isPrivateRouting(mirror));
-    // The files now hold the mirror's settings, including any that came from another machine
     const meta = this.globalState.get(this.storageKey, {})[SYNC_META_KEY];
+    // Routing off in a mirror from before settings sync was confirmed here when it was turned off.
+    // A stamped mirror can hold another machine's "off", so that still asks here
+    this.setRoutingOffAllowed(!meta && !isPrivateRouting(mirror));
+    // The files now hold the mirror's settings, including any that came from another machine
     this.writeAppliedSyncIds(typeof meta?.id === 'string' ? [meta.id] : []);
     fs.writeFileSync(this.migratedFile, '');
     this.log.appendLine('moved settings into settings.toml');
@@ -368,6 +371,8 @@ class SettingsFile {
         settingsReadable = false;
         errors.push(`settings.toml: ${error.message}`);
         next = { ...this.state };
+        // A new window's entries start from the mirror, which can hold another machine's "off"
+        if (unconfirmed(next)) next.HostAiPrivateRouting = encode(true);
       }
       try {
         next = withKeybindings(next, read(this.keybindingsFile));
@@ -377,6 +382,11 @@ class SettingsFile {
       return next;
     };
     const unconfirmed = (entries) => !isPrivateRouting(entries) && !fs.existsSync(this.routingAllowedFile);
+    // Routing off in the mirror that this machine hasn't allowed came from another machine, and
+    // this one keeps routing on until it's asked, or after it declined. Not when this window last read
+    // it off itself: a window here turning it back on removes the marker before the mirror shows that
+    const othersOff =
+      !isPrivateRouting(this.mirrorEntries()) && !fs.existsSync(this.routingAllowedFile) && !this.routingOffHere;
     let next = fromFiles();
     if (confirm && settingsReadable && unconfirmed(next)) {
       // One dialog for every sync that asks at once
@@ -389,7 +399,8 @@ class SettingsFile {
     }
     if (settingsReadable && isPrivateRouting(next)) this.setRoutingOffAllowed(false);
     this.routingPending = settingsReadable && !confirm && unconfirmed(next);
-    if (settingsReadable && unconfirmed(next)) {
+    const keptOn = settingsReadable && unconfirmed(next);
+    if (keptOn) {
       next = { ...next, HostAiPrivateRouting: encode(true) };
       if (confirm) {
         fs.writeFileSync(this.file, updateToml(read(this.file), { HostAiPrivateRouting: encode(true) }));
@@ -398,8 +409,14 @@ class SettingsFile {
     }
     const changes = changedEntries(this.state, next);
     this.state = next;
+    this.routingOffHere = !isPrivateRouting(next);
     for (const key of Object.keys(changes)) this.pendingChanges.add(key);
-    if (Object.keys(changes).length) await this.updateMirror(changes);
+    // Routing kept on here isn't a change to send to other machines, which would turn it back on
+    // where it was turned off. Neither is routing on against another machine's "off": a new window
+    // starts from the mirror, so it reads a declined machine's file as turning routing on
+    const { HostAiPrivateRouting: _routing, ...shared } = changes;
+    const mirrorChanges = keptOn || (othersOff && isPrivateRouting(next)) ? shared : changes;
+    if (Object.keys(mirrorChanges).length) await this.updateMirror(mirrorChanges);
     return { changes, errors };
   }
 
