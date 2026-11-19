@@ -107,11 +107,10 @@ ${TOML.stringify(panelDefaults)
 const DEFAULTS_INTRO = '# this comment.\n';
 
 /**
- * A panel default edited inside the header's comment (e.g. "# history_sync = true") is easy to
- * mistake for a setting. Returns the text with each one that differs from its default, and that the
- * file doesn't set itself, moved into the settings, and the header restored; null if there's none.
+ * The panel defaults commented in settings.toml text's header; null if it has none, or the header
+ * or the file doesn't parse.
  */
-function promoteEditedDefaults(text) {
+function headerDefaults(text) {
   const intro = text.indexOf(DEFAULTS_INTRO);
   if (intro === -1) return null;
   const lines = text.slice(intro + DEFAULTS_INTRO.length).split('\n');
@@ -120,20 +119,32 @@ function promoteEditedDefaults(text) {
     if (!line.startsWith('#')) break;
     commented.push(line.replace(/^# ?/, ''));
   }
-  let block;
-  let doc;
   try {
-    block = TOML.parse(commented.join('\n'));
-    doc = TOML.parse(text);
+    TOML.parse(text);
+    return JSON.parse(JSON.stringify(TOML.parse(commented.join('\n'))));
   } catch {
     return null;
   }
+}
+
+/**
+ * A panel default edited inside the header's comment (e.g. "# history_sync = true") is easy to
+ * mistake for a setting. Returns the text with each one that changed since `seen` (the file as last
+ * read), differs from its default, and that the file doesn't set itself, moved into the settings,
+ * and the header restored; null if there's none. A header an older version wrote still shows that
+ * version's defaults, which aren't edits.
+ */
+function promoteEditedDefaults(text, seen) {
+  const block = headerDefaults(text);
+  const before = headerDefaults(seen);
+  if (!block || !before) return null;
+  const doc = TOML.parse(text);
   const promoted = [];
   for (const [storageKey, value] of Object.entries(DEFAULTS)) {
     const tomlPath = SETTINGS_MAP[storageKey];
     const edited = getPath(block, tomlPath);
     if (edited === undefined || getPath(doc, tomlPath) !== undefined) continue;
-    if (isDeepStrictEqual(JSON.parse(JSON.stringify(edited)), value)) continue;
+    if (isDeepStrictEqual(edited, value) || isDeepStrictEqual(edited, getPath(before, tomlPath))) continue;
     setPath(doc, tomlPath, edited);
     promoted.push(tomlPath);
   }
@@ -277,6 +288,8 @@ class SettingsFile {
     this.routingPending = false;
     // Set while the files this window last read have private routing off, allowed on this machine
     this.routingOffHere = false;
+    // settings.toml as this window last read it, to tell edits in its header comment
+    this.seenSettings = '';
     const dir = context.globalStorageUri.fsPath;
     this.file = path.join(dir, 'settings.toml');
     this.keybindingsFile = path.join(dir, 'keybindings.yaml');
@@ -420,12 +433,20 @@ class SettingsFile {
     return { changes, errors };
   }
 
-  /** Moves panel defaults edited inside settings.toml's header comment into its settings. */
+  /**
+   * Moves panel defaults edited inside settings.toml's header comment into its settings. Only
+   * edits made after this window first read the file count, so an older version's header can't
+   * pin its defaults.
+   */
   promoteEditedDefaults() {
     let result;
     try {
-      result = promoteEditedDefaults(read(this.file));
+      const text = read(this.file);
+      result = promoteEditedDefaults(text, this.seenSettings);
       if (result) fs.writeFileSync(this.file, result.text);
+      // A file broken by an edit in progress doesn't replace the last good one, so a header edit
+      // saved with an error elsewhere still applies once that's fixed
+      if (headerDefaults(result?.text ?? text)) this.seenSettings = result?.text ?? text;
     } catch (error) {
       this.log.appendLine(`settings.toml: ${error.message}`);
       return;
