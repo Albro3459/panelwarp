@@ -1,0 +1,4 @@
+media/fallback-fonts/noto-color-emoji/NotoColorEmoji-Regular.ttf filter=lfs diff=lfs merge=lfs -text
+media/fallback-fonts/noto-sans-hk/NotoSansHK-Regular.ttf filter=lfs diff=lfs merge=lfs -text
+media/fallback-fonts/noto-sans-sc/NotoSansSC-Regular.ttf filter=lfs diff=lfs merge=lfs -text
+media/fallback-fonts/noto-sans-tc/NotoSansTC-Regular.ttf filter=lfs diff=lfs merge=lfs -text
