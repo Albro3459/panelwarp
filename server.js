@@ -489,6 +489,7 @@ async function startServer({
     ws.on('message', (data, isBinary) => {
       if (isBinary) {
         session.debug('warp->pty', Buffer.from(data));
+        session.recorder.input();
         session.term.write(Buffer.from(data));
         return;
       }

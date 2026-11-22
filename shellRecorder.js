@@ -49,6 +49,8 @@ class ShellRecorder {
     this.adoptable = true;
     /** Warp session ids the shell's hooks use: its own (first), then subshells and SSH. */
     this.sessionIds = [];
+    /** Whether the shell sends InputBuffer when Warp asks for it, which bash before 4.0 can't. */
+    this.reportsInput = true;
     this.tailHead = [];
     this.tailHeadBytes = 0;
     this.tailRest = [];
@@ -62,12 +64,16 @@ class ShellRecorder {
     this.running = false;
     /** The latest tab title the shell set, which comes before the prompt's hooks. */
     this.title = null;
-    /** Output at the prompt since Warp last asked for the input buffer, kept only in case the
-     * user's command follows (its echo); null until the prompt is up. */
+    /** Output at the prompt since Warp last asked for the input buffer (see `input` for a shell
+     * that can't report it), kept only in case the user's command follows (its echo); null until
+     * the prompt is up. */
     this.idleOutput = null;
     this.idleOutputBytes = 0;
     /** Whether Warp's own commands printed hooks since it last asked for the input buffer. */
     this.idleHooks = false;
+    /** Whether Warp's own command at the prompt ended, in a shell that can't report its input
+     * buffer (which would otherwise come next). */
+    this.inBandEnded = false;
   }
 
   /**
@@ -119,7 +125,10 @@ class ShellRecorder {
         this.adoptable = false;
         this.bootstrap = [];
       }
-      if (ownHook && hook.name === 'Bootstrapped') this.bootstrapped = true;
+      if (ownHook && hook.name === 'Bootstrapped') {
+        this.bootstrapped = true;
+        this.reportsInput = !hook.noInputBuffer;
+      }
       return;
     }
     // Nothing more is needed once a new page can't take the shell over
@@ -149,7 +158,11 @@ class ShellRecorder {
       const start = Buffer.concat([...this.tailHead, ...this.tailRest])
         .toString('latin1')
         .replace(SUBSHELL_REQUEST, '');
-      this.nested.push({ sessionId: hook.sessionId, start: Buffer.from(start, 'latin1') });
+      this.nested.push({
+        sessionId: hook.sessionId,
+        start: Buffer.from(start, 'latin1'),
+        reportsInput: !hook.noInputBuffer,
+      });
       this.nestedBytes += start.length;
       this.resetTail();
       if (this.nested.length > MAX_NESTED_SESSIONS || this.nestedBytes > MAX_NESTED_BYTES) {
@@ -168,17 +181,16 @@ class ShellRecorder {
     // Warp asks for the input buffer whenever its input is up again, so what follows at the
     // prompt is Warp's own commands, or the echo of the user's
     if (currentHook && hook.name === 'InputBuffer' && !this.running) {
-      this.idleOutput = [];
-      this.idleOutputBytes = 0;
-      this.idleHooks = false;
+      this.startIdle();
       return;
     }
     if (this.idleOutput) {
       if (!userPrecmd && !userPreexec) {
         if (currentHook) this.idleHooks = true;
+        if (currentHook && hook.afterInBand && !this.innermostReportsInput()) this.inBandEnded = true;
         // Warp only runs its commands while a page shows the shell, so output without one (a
         // background job's) is kept for the next page, unless a command Warp started is ending
-        if (!attached && !hook && !this.idleHooks) {
+        if (!attached && !hook && (!this.idleHooks || this.inBandEnded)) {
           this.pushTail(Buffer.from(bytes));
           return;
         }
@@ -197,6 +209,31 @@ class ShellRecorder {
     if (userPreexec) this.running = true;
     if (currentHook && (hook.name === 'CommandFinished' || hook.name === 'Precmd')) this.running = false;
     this.pushTail(Buffer.from(bytes));
+  }
+
+  /**
+   * Called with each write from the page to the shell. A shell that never sends InputBuffer (bash
+   * before 4.0) gets the same cut here: Warp writes at the prompt only to run its own command or
+   * the user's, so what follows is that command's echo. Accepted limit: with the user's own prompt
+   * (PS1) on, the cut isn't tied to the end of the prompt, so a new page can get that prompt twice,
+   * or not at all, until the next command.
+   */
+  input() {
+    if (!this.bootstrapped || !this.adoptable || this.running || this.innermostReportsInput()) return;
+    // A command written in parts keeps its echo; one after Warp's own commands starts over
+    if (this.idleOutput && !this.idleHooks) return;
+    this.startIdle();
+  }
+
+  innermostReportsInput() {
+    return (this.nested.at(-1) ?? this).reportsInput;
+  }
+
+  startIdle() {
+    this.idleOutput = [];
+    this.idleOutputBytes = 0;
+    this.idleHooks = false;
+    this.inBandEnded = false;
   }
 
   resetTail() {
@@ -263,6 +300,11 @@ function parseHook(hex) {
     sessionId: /"session_id"\s*:\s*(\d+)/.exec(json)?.[1] ?? null,
     afterInBand: /"is_after_in_band_command"\s*:\s*true/.test(json),
     inBand: /"command"\s*:\s*"\s*warp_run_generator_command/.test(json),
+    // Warp asks bash for its input buffer only from 4.0 (`input_reporting_sequence`)
+    noInputBuffer:
+      name === 'Bootstrapped' &&
+      /"shell"\s*:\s*"bash"/.test(json) &&
+      Number(/"shell_version"\s*:\s*"(\d+)/.exec(json)?.[1]) < 4,
   };
 }
 

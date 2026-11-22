@@ -85,6 +85,88 @@ test('native shell completions are left out too', () => {
   assert.equal(recorder.running, false);
 });
 
+// bash before 4.0 can't report its input buffer, so Warp writes its commands without asking
+const OLD_BASH_BOOTSTRAP = `bootstrap script\r\n${hook('InitShell')}${hook('Bootstrapped', {
+  shell: 'bash',
+  shell_version: '3.2.57(1)-release',
+})}`;
+const OLD_BASH_PROMPT = '\x1b]0;~\x07';
+const WRITE = Symbol('the page writes to the shell');
+
+function oldBashInBand(command, session) {
+  const [, ...output] = inBandCommand(command, session);
+  return [WRITE, ...output];
+}
+
+function oldBashOutput(...steps) {
+  const recorder = new ShellRecorder();
+  for (const step of steps) {
+    if (step === WRITE) recorder.input();
+    else recorder.record(Buffer.from(step, 'latin1'), true);
+  }
+  return recorder;
+}
+
+test("bash before 4.0: a reloaded page gets the prompt without the old page's completions", () => {
+  const recorder = oldBashOutput(
+    OLD_BASH_BOOTSTRAP,
+    PROMPT_HOOK,
+    OLD_BASH_PROMPT,
+    ...oldBashInBand(),
+    ...oldBashInBand("warp_run_generator_command 2 'git branch'"),
+  );
+
+  assert.equal(replayed(recorder), OLD_BASH_BOOTSTRAP + OLD_BASH_PROMPT + PROMPT_HOOK + OLD_BASH_PROMPT);
+  assert.equal(recorder.running, false);
+});
+
+test("bash before 4.0: a reloaded page gets the user's running command with its echo only", () => {
+  const preexec = hook('Preexec', { command: 'sleep 60' });
+  const recorder = oldBashOutput(
+    OLD_BASH_BOOTSTRAP,
+    PROMPT_HOOK,
+    OLD_BASH_PROMPT,
+    ...oldBashInBand(),
+    WRITE,
+    'sleep 60\r\n',
+    WRITE,
+    preexec,
+    'still sleeping',
+  );
+
+  assert.equal(
+    replayed(recorder),
+    OLD_BASH_BOOTSTRAP + OLD_BASH_PROMPT + PROMPT_HOOK + OLD_BASH_PROMPT + 'sleep 60\r\n' + preexec + 'still sleeping',
+  );
+  assert.equal(recorder.running, true);
+});
+
+test("bash before 4.0: output while no page shows the shell after Warp's command is kept for the next page", () => {
+  const recorder = oldBashOutput(OLD_BASH_BOOTSTRAP, PROMPT_HOOK, OLD_BASH_PROMPT, ...oldBashInBand());
+  recorder.record(Buffer.from('server listening on :3000\r\n', 'latin1'), false);
+
+  assert.equal(
+    replayed(recorder),
+    OLD_BASH_BOOTSTRAP + OLD_BASH_PROMPT + PROMPT_HOOK + OLD_BASH_PROMPT + 'server listening on :3000\r\n',
+  );
+});
+
+test('a shell that reports its input buffer keeps the prompt that came before the first write', () => {
+  const recorder = oldBashOutput(BOOTSTRAP, PROMPT_HOOK, WRITE, PROMPT, ...inBandCommand(), INPUT_BUFFER);
+
+  assert.equal(replayed(recorder), BOOTSTRAP + TITLE + PROMPT_HOOK + PROMPT);
+});
+
+test('bash 4.0 and later keeps the prompt that came before the first write', () => {
+  const bootstrap = `bootstrap script\r\n${hook('InitShell')}${hook('Bootstrapped', {
+    shell: 'bash',
+    shell_version: '5.3.3(1)-release',
+  })}`;
+  const recorder = oldBashOutput(bootstrap, PROMPT_HOOK, WRITE, PROMPT, ...inBandCommand(), INPUT_BUFFER);
+
+  assert.equal(replayed(recorder), bootstrap + TITLE + PROMPT_HOOK + PROMPT);
+});
+
 test('output while no page shows the shell is kept for the next page', () => {
   const recorder = shellOutput(BOOTSTRAP, PROMPT_HOOK, PROMPT, ...inBandCommand(), INPUT_BUFFER);
   recorder.record(Buffer.from('server listening on :3000\r\n', 'latin1'), false);
@@ -212,6 +294,46 @@ test('a reloaded page gets the local prompt after the user leaves SSH', () => {
   );
 
   assert.equal(replayed(recorder), BOOTSTRAP + TITLE + PROMPT_HOOK + PROMPT);
+  assert.equal(recorder.running, false);
+});
+
+test("SSH into bash before 4.0: a reloaded page gets the remote prompt without the old page's completions", () => {
+  const sshStart = [...SSH_START.slice(0, -1), hook('Bootstrapped', { ...REMOTE, shell: 'bash', shell_version: '3.2.57(1)-release' })];
+  const recorder = oldBashOutput(
+    BOOTSTRAP,
+    PROMPT_HOOK,
+    PROMPT,
+    INPUT_BUFFER,
+    ...sshStart,
+    hook('CommandFinished', { ...REMOTE, exit_code: 0 }),
+    REMOTE_PROMPT_HOOK,
+    REMOTE_PROMPT,
+    ...oldBashInBand("warp_run_generator_command 2 'git branch'", REMOTE),
+  );
+
+  assert.equal(replayed(recorder), BOOTSTRAP + PROMPT_HOOK + PROMPT + sshStart.join('') + TITLE + REMOTE_PROMPT_HOOK + REMOTE_PROMPT);
+  assert.equal(recorder.running, false);
+});
+
+test('SSH from bash before 4.0 into a shell that reports its input buffer keeps the remote prompt', () => {
+  const recorder = oldBashOutput(
+    OLD_BASH_BOOTSTRAP,
+    PROMPT_HOOK,
+    OLD_BASH_PROMPT,
+    WRITE,
+    ...SSH_START,
+    hook('CommandFinished', { ...REMOTE, exit_code: 0 }),
+    REMOTE_PROMPT_HOOK,
+    WRITE,
+    REMOTE_PROMPT,
+    ...inBandCommand("warp_run_generator_command 2 'git branch'", REMOTE),
+    REMOTE_INPUT_BUFFER,
+  );
+
+  assert.equal(
+    replayed(recorder),
+    OLD_BASH_BOOTSTRAP + PROMPT_HOOK + OLD_BASH_PROMPT + SSH_START.join('') + TITLE + REMOTE_PROMPT_HOOK + REMOTE_PROMPT,
+  );
   assert.equal(recorder.running, false);
 });
 
