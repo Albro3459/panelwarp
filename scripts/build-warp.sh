@@ -6,6 +6,7 @@
 #   --release  release-wasm profile: fat LTO + wasm-opt, the build to ship. ~9 min.
 #   --note "Shells other than zsh"  what the build adds, shown in the notification (default: the
 #              newest Warp commit's subject, marked "+ uncommitted" when the tree has changes)
+# Warp's About page shows the extension's version from package.json.
 # The panel loads whichever bundle was built most recently (see resolveBundleDir in extension.js).
 set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +28,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+HOST_VERSION=$(node -p 'require(process.argv[1]).version' "$SCRIPT_DIR/../package.json") || exit 1
 cd "$WARP_SRC" || exit 1
 if [ -z "$NOTE" ]; then
   NOTE="$(git log -1 --format=%s)"
@@ -48,7 +50,8 @@ optimize() {
     && mv "$B/wasm/warp_bg.opt.wasm" "$B/wasm/warp_bg.wasm"
 }
 start=$(date +%s)
-if ./script/wasm/bundle --no-split --channel oss --profile "$PROFILE" --features remote_tty >"$LOG" 2>&1 \
+if WARP_ABOUT_VERSION="v$HOST_VERSION" \
+  ./script/wasm/bundle --no-split --channel oss --profile "$PROFILE" --features remote_tty >"$LOG" 2>&1 \
   && optimize; then
   secs=$(( $(date +%s) - start ))
   echo "build ok ($PROFILE) in ${secs}s: $NOTE"

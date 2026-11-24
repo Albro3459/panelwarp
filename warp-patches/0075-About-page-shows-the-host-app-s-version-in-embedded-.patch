@@ -1,0 +1,27 @@
+From c4aa248de4e02d7ff742ab5f42b4b2364f42f31d Mon Sep 17 00:00:00 2001
+From: Alex Brodsky <122503996+Albro3459@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:33:39 -0800
+Subject: [PATCH 75/75] About page shows the host app's version in embedded
+ builds
+
+Embedded builds have no Warp release tag, so the About page showed the placeholder v#.##.###. It now shows WARP_ABOUT_VERSION when the build sets it, and panelwarp's build script sets it to the extension's version. Warp's release tag stays unset, so updates, telemetry and crash reports behave as before. Desktop builds are unchanged.
+---
+ app/src/settings_view/about_page.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/settings_view/about_page.rs b/app/src/settings_view/about_page.rs
+index 1405338..673f770 100644
+--- a/app/src/settings_view/about_page.rs
++++ b/app/src/settings_view/about_page.rs
+@@ -72,7 +72,10 @@ impl SettingsWidget for AboutPageWidget {
+             "bundled/svg/warp-logo-with-dark-title.svg"
+         };
+ 
+-        let version = ChannelState::app_version().unwrap_or("v#.##.###");
++        let version = ChannelState::app_version();
++        #[cfg(all(target_family = "wasm", feature = "remote_tty"))]
++        let version = option_env!("WARP_ABOUT_VERSION").or(version);
++        let version = version.unwrap_or("v#.##.###");
+ 
+         let version_text = ui_builder
+             .span(version.to_string())
